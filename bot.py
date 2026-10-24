@@ -6,6 +6,7 @@ import re
 import signal
 from urllib.parse import urlparse
 import secrets
+import sys
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_UP, getcontext
 
@@ -14,6 +15,7 @@ from aiohttp import web
 import asyncpg
 
 from crypto import ASSETS, Crypto, ton_address, tx_hash
+from storefront import StoreUI, UI_SCHEMA
 
 
 logging.basicConfig(
@@ -33,7 +35,7 @@ def parse_admin_ids(raw):
 
 ADMINS = parse_admin_ids(os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID", ""))
 BOT_IDS = {}
-VERSION = "snowman-2026-10-24-product-form"
+VERSION = "snowman-2026-10-24-buttons-payments"
 
 
 CURRENCIES = sorted(
@@ -338,6 +340,7 @@ def home_buttons():
         ("📦 My orders", "myorders"),
         ("🔔 Enable reminders & alerts", "alerts:on"),
         ("🔕 Disable reminders & alerts", "alerts:off"),
+        ("🚚 Delivery details", "deliverydetails"),
         ("💬 Support", "support"),
     ])
 
@@ -349,32 +352,11 @@ def enabled_crypto():
 
 
 async def local_methods():
-    rows = await db.fetch("SELECT key,value FROM settings WHERE key LIKE 'method:%' OR key LIKE 'rate:%'")
-    config = {row["key"]: row["value"] for row in rows}
-    result = {}
-    for code in CURRENCIES:
-        instructions = config.get("method:" + code, "").strip()
-        raw_rate = config.get("rate:" + code, "1" if code == "USD" else "")
-        if not instructions or not raw_rate:
-            continue
-        try:
-            rate = positive(raw_rate)
-        except (ValueError, ArithmeticError):
-            continue
-        result[code] = (instructions, rate)
-    return result
+    return await ui.local_methods()
 
 
 async def admin_panel(chat):
-    await admin_bot.send(chat, "☃️ SnowmanBot Admin\nChoose an option below.", keyboard([
-        ("📦 Products", "admin:products"),
-        ("➕ Add product", "admin:add"),
-        ("🧾 Orders & payments", "admin:orders"),
-        ("📊 Statistics", "admin:stats"),
-        ("⚙️ Payments & reminders", "admin:settings"),
-        ("📖 All commands", "admin:help"),
-        ("🆔 My Telegram ID", "admin:myid"),
-    ]))
+    return await ui.menu(chat)
 
 
 async def local_currency_menu(chat, product_id=0, page=0):
@@ -432,7 +414,7 @@ async def begin_checkout(chat, product_id, method, request_key, currency=None):
         shipping = await db.fetchval("SELECT shipping FROM users WHERE id=$1", chat)
         if not shipping:
             await state(chat, {"shipping": product_id, "checkout": {"method": method, "currency": currency}})
-            return await main_bot.send(chat, "Send your name, phone number, country and full delivery address in one message. /cancel to cancel.")
+            return await main_bot.send(chat, "Send your name, phone number, country and full delivery address in one message.", keyboard([("✖ Cancel", "home")]))
     elif method != "stars":
         raise ValueError("This digital product uses Telegram Stars.")
     order = await create_order(chat, product_id, method, request_key, local_currency=currency)
@@ -472,13 +454,14 @@ async def queue(
     chat,
     text,
     marketing=False,
+    buttons=None,
 ):
     await conn.execute(
         """
         INSERT INTO jobs(
-            dedup,target,chat,text,marketing
+            dedup,target,chat,text,marketing,buttons
         )
-        VALUES($1,$2,$3,$4,$5)
+        VALUES($1,$2,$3,$4,$5,$6::jsonb)
         ON CONFLICT(dedup) DO NOTHING
         """,
         dedup,
@@ -486,10 +469,11 @@ async def queue(
         chat,
         text[:4000],
         marketing,
+        json.dumps(buttons) if buttons else None,
     )
 
 
-async def alert_admins(conn, key, text):
+async def alert_admins(conn, key, text, buttons=None):
     for admin_id in ADMINS:
         await queue(
             conn,
@@ -497,6 +481,7 @@ async def alert_admins(conn, key, text):
             "admin",
             admin_id,
             text,
+            buttons=buttons,
         )
 
 
@@ -634,6 +619,7 @@ async def create_order(
     units = None
     address = None
     note = ""
+    payment_bank = None
 
     currency = "XTR"
     amount = product["price"]
@@ -661,20 +647,11 @@ async def create_order(
         if method == "local":
             currency = local_currency or user["currency"]
 
-            rate = await setting(
-                "rate:" + currency,
-                "1" if currency == "USD" else "",
-            )
-
-            note = await setting(
-                "method:" + currency
-            )
-
-            if not rate or not note:
-                raise ValueError(
-                    "Local payment is unavailable "
-                    "for this currency."
-                )
+            payment_bank = (await ui.banks()).get(currency)
+            if not payment_bank or not payment_bank['ready']:
+                raise ValueError("This bank is not ready. Choose another payment method.")
+            rate = str(payment_bank['rate'])
+            note = ui.bank_text(payment_bank)
 
             quantum = (
                 Decimal("1")
@@ -843,99 +820,24 @@ async def create_order(
                 note,
             )
 
+            if method == "local":
+                await ui.snapshot_bank(conn, order, account=payment_bank)
+
     return order
 
 
 async def show_order(chat, order):
-    text = (
-        f"Order #{order['id']} • {order['name']}\n"
-        f"Status: {order['status']}\n"
-        f"Amount: {format_amount(order['amount'], order['currency'])}"
-    )
-
-    if (
-        order["asset"]
-        and order["status"] == "pending"
-    ):
-        amount = (
-            Decimal(order["units"])
-            / Decimal(10) ** ASSETS[order["asset"]][1]
-        )
-
-        text = (
-            f"Order #{order['id']} • {order['name']}\n"
-            f"Status: {order['status']}\n"
-            f"Send EXACTLY {format_amount(amount, order['asset'])}\n"
-            f"Network: {ASSETS[order['asset']][0]}\n"
-            f"Address: {order['address']}\n"
-            f"Send by: "
-            f"{order['expires']:%Y-%m-%d %H:%M UTC}\n\n"
-            "Fees must be paid separately. "
-            "Do not round the amount.\n"
-            f"After sending: /tx {order['id']} "
-            "TRANSACTION_HASH\n"
-            "TON: use the receiving wallet's "
-            "transaction hash."
-        )
-
-    elif (
-        order["method"] == "local"
-        and order["status"] in ("pending", "review")
-    ):
-        text += (
-            f"\n\n{order['note']}\n"
-            f"Reference: SNOW-{order['id']}\n"
-            "Send proof as a photo/document "
-            "with caption:\n"
-            f"/proof {order['id']}"
-        )
-
-    if (
-        order["asset"]
-        and order["status"] == "pending"
-        and order["expires"] <= now()
-    ):
-        text = (
-            f"Order #{order['id']}: quote expired. "
-            "Do not send a new payment. "
-            "If you already paid on time, submit "
-            f"/tx {order['id']} TRANSACTION_HASH "
-            "or use /support."
-        )
-
-    if order["status"] == "fulfilled":
-        text += "\nDelivery: " + order["note"]
-
-    await main_bot.send(chat, text)
-
-    if (
-        order["status"] in ("paid", "fulfilled")
-        and order["kind"] == "digital"
-    ):
-        if order["delivery"]:
-            await main_bot.send(
-                chat,
-                order["delivery"],
-            )
-
-        if order["file"]:
-            await main_bot.call(
-                "sendDocument",
-                chat_id=chat,
-                document=(
-                    order["filename"] or "product.bin",
-                    order["file"],
-                ),
-            )
+    return await ui.show_order(chat, order)
 
 
-async def mark_paid(conn, order):
+async def mark_paid(conn, order, source="stars"):
     await conn.execute(
         """
-        UPDATE orders SET status='paid'
+        UPDATE orders SET status='paid',payment_source=$2
         WHERE id=$1
         """,
         order["id"],
+        source,
     )
 
     await queue(
@@ -944,11 +846,10 @@ async def mark_paid(conn, order):
         "main",
         order["user_id"],
         (
-            f"Payment confirmed for order "
-            f"#{order['id']}: {order['name']}.\n"
-            f"Open /order {order['id']} to view "
-            "your purchase/digital delivery."
+            f"{'Payment approved by the store' if source == 'admin' else 'Network payment confirmed' if source == 'network' else 'Payment confirmed'} for order "
+            f"#{order['id']}: {order['name']}."
         ),
+        buttons=keyboard([("View order", f"receipt:{order['id']}"), ("Support", "support")]),
     )
 
     if order["kind"] == "digital":
@@ -968,52 +869,13 @@ async def mark_paid(conn, order):
             f"Customer: {order['user_id']}\n"
             f"Method: {order['method']}\n"
             f"Delivery: {order['shipping']}\n"
-            f"Inspect: /order {order['id']}"
+            f"Confirmation: {source}"
         ),
+        buttons=keyboard([("View order", f"ui:order:{order['id']}")]),
     )
 
 
-ADMIN_HELP = """SnowmanBot admin
-
-/admin — open admin menu
-/myid — show your personal Telegram user ID
-
-/add physical | Product name | USD price | Description
-/add digital | Product name | Integer Stars price | Description
-
-/edit ID name | New name
-/edit ID price | New price
-/edit ID description | New description
-/delivery ID Delivery text or download link
-
-Send photo with caption /photo ID (max 5 MB)
-Send digital file with caption /file ID (max 10 MB)
-
-/publish ID — publish + one new-product alert
-/hide ID — hide from store
-/products — list products
-
-/method NGN | Bank/mobile-money instructions
-/method NGN | off — disable method
-/rate NGN 1600 — example only: local units per USD
-
-/reminder 09:00 | Your daily message (UTC)
-/reminderoff — disable daily reminders
-
-/orders — recent orders
-/order ID — order details
-/approve ID — confirm LOCAL payment after checking your bank
-/reject ID — reject LOCAL payment
-/fulfill ID | Shipping/tracking information
-/refund ID — refund a Stars payment
-
-/stats — users, orders, queue counts
-/retryjob ID — resend an uncertain notification
-/rescan ID — recheck an unresolved crypto order
-
-Run /start in BOTH bots.
-Configure payment details before publishing.
-"""
+ADMIN_HELP = "Use the buttons to manage products, bank accounts, rates, payments and reminders."
 
 
 async def product_wizard(chat, action=None, message=None):
@@ -1059,10 +921,10 @@ async def product_wizard(chat, action=None, message=None):
                         f"wizard:{chat}:{token}", state["kind"], state["name"], positive(state["price"]), state["description"], image_bytes, file_bytes, filename, state.get("delivery", ""))
                     if action == "publish":
                         await conn.execute("UPDATE products SET published=true WHERE id=$1", pid)
-                        await conn.execute("""INSERT INTO jobs(dedup,target,chat,text,marketing)
-                            SELECT 'product:'||$1::text||':'||id::text,'main',id,$2,true FROM users
+                        await conn.execute("""INSERT INTO jobs(dedup,target,chat,text,marketing,buttons)
+                            SELECT 'product:'||$1::text||':'||id::text,'main',id,$2,true,$3::jsonb FROM users
                             WHERE alerts AND NOT blocked ON CONFLICT(dedup) DO NOTHING""", str(pid),
-                            f"New product: {state['name']}\nOpen /product {pid} to see it.\n/stop to unsubscribe.")
+                            f"New product: {state['name']}", json.dumps(keyboard([("View product", f"viewproduct:{pid}"), ("Disable alerts", "alerts:off")])))
                     await conn.execute("DELETE FROM admin_product_drafts WHERE admin_id=$1 AND token=$2", chat, token)
             await admin_bot.send(chat, f"✅ Product #{pid} {'published' if action == 'publish' else 'saved as a draft'}.", keyboard([("➕ Add another product", "admin:add"), ("📦 Products", "admin:products"), ("← Admin menu", "admin:menu")]))
             return True
@@ -1128,7 +990,7 @@ async def product_wizard(chat, action=None, message=None):
     return True
 
 
-async def admin_message(message, request_key):
+async def legacy_admin_message(message, request_key):
     chat = message["chat"]["id"]
 
     text = (
@@ -1714,6 +1576,10 @@ async def admin_message(message, request_key):
     await admin_bot.send(chat, "Saved.")
 
 
+async def admin_message(message, request_key):
+    return await ui.admin_message(message, request_key)
+
+
 async def customer_message(message):
     chat = message["chat"]["id"]
     payment = message.get("successful_payment")
@@ -1816,7 +1682,10 @@ async def customer_message(message):
         chat,
     )
 
-    pending = json.loads(user["state"])
+    pending = json.loads(user["state"]) if isinstance(user["state"], str) else dict(user["state"] or {})
+
+    if not cmd.startswith("/") and "shipping" not in pending and await ui.customer_input(message, pending):
+        return
 
     if cmd in ("/cancel", "/start"):
         await state(chat, {})
@@ -1871,25 +1740,7 @@ async def customer_message(message):
         return await product_card(chat, product)
 
     if cmd == "/orders":
-        rows = await db.fetch(
-            """
-            SELECT id,name,status FROM orders
-            WHERE user_id=$1
-            ORDER BY id DESC LIMIT 20
-            """,
-            chat,
-        )
-
-        text = "\n".join(
-            f"/order {row['id']} — {row['name']} "
-            f"({row['status']})"
-            for row in rows
-        )
-
-        return await main_bot.send(
-            chat,
-            text or "No orders yet.",
-        )
+        return await ui.orders(chat, customer=True)
 
     if cmd == "/address":
         if not rest:
@@ -1936,112 +1787,8 @@ async def customer_message(message):
             return await show_order(chat, order)
 
         if cmd == "/tx":
-            if (
-                not order["asset"]
-                or order["status"] != "pending"
-            ):
-                raise ValueError(
-                    "This order does not accept "
-                    "a transaction hash."
-                )
-
-            value = tx_hash(
-                order["asset"],
-                value,
-            )
-
-            await db.execute(
-                """
-                UPDATE orders SET txid=$2
-                WHERE id=$1 AND status='pending'
-                """,
-                order["id"],
-                value,
-            )
-
-            return await main_bot.send(
-                chat,
-                "Transaction saved. I will verify "
-                "the exact amount, destination, "
-                "network, payment time and confirmations. "
-                f"Use /order {order['id']} "
-                "to check status.",
-            )
-
-        if (
-            order["method"] != "local"
-            or order["status"] not in (
-                "pending", "review"
-            )
-        ):
-            raise ValueError(
-                "This order does not accept "
-                "local-payment proof."
-            )
-
-        if (
-            not message.get("photo")
-            and not message.get("document")
-        ):
-            raise ValueError(
-                "Send a photo/file with caption "
-                "/proof ORDER_ID"
-            )
-
-        media = (
-            message["photo"][-1]
-            if message.get("photo")
-            else message["document"]
-        )
-
-        content = await main_bot.download(
-            media["file_id"],
-            10 * 1024 * 1024,
-        )
-
-        async with db.acquire() as conn:
-            async with conn.transaction():
-                changed = await conn.fetchval(
-                    """
-                    UPDATE orders
-                    SET status='review',
-                        proof=$2,
-                        proof_name=$3
-                    WHERE id=$1
-                      AND status IN ('pending','review')
-                    RETURNING id
-                    """,
-                    order["id"],
-                    content,
-                    media.get("file_name", "proof.jpg"),
-                )
-
-                if not changed:
-                    raise ValueError(
-                        "Order status changed. "
-                        "Use /order to check it."
-                    )
-
-                await alert_admins(
-                    conn,
-                    (
-                        f"proof:{order['id']}:"
-                        f"{message['message_id']}"
-                    ),
-                    (
-                        "New local-payment proof: "
-                        f"/order {order['id']}\n"
-                        "Check your bank, then "
-                        f"/approve {order['id']} or "
-                        f"/reject {order['id']}."
-                    ),
-                )
-
-        return await main_bot.send(
-            chat,
-            "Proof submitted. We will notify you "
-            "after payment review.",
-        )
+            return await ui.save_hash(chat, dict(order), value)
+        return await ui.save_proof(chat, dict(order), message)
 
     if (
         "shipping" in pending
@@ -2070,7 +1817,8 @@ async def customer_message(message):
 
     await main_bot.send(
         chat,
-        "Use /start to open the store.",
+        "Choose an option below.",
+        home_buttons(),
     )
 
 
@@ -2082,21 +1830,9 @@ async def callback(query, admin, request_key):
     except TGError:
         pass
     if admin:
-        if data == "admin:menu":
-            return await admin_panel(chat)
-        if data == "admin:myid":
-            return await bot.send(chat, f"Your Telegram user ID: {chat}")
-        if data == "admin:add":
-            return await product_wizard(chat, action="start")
-        if data.startswith("form:"):
-            return await product_wizard(chat, action=data[5:])
-        if data == "admin:settings":
-            return await bot.send(chat, "Bank details: /method NGN | Your account details\nExchange rate: /rate NGN YOUR_RATE\nDaily reminder (UTC): /reminder 08:00 | Your message\nDisable reminder: /reminderoff\n\nOnly configured bank currencies appear to customers. Crypto wallet addresses remain in hosting variables.", keyboard([("← Admin menu", "admin:menu")]))
-        if data in ("admin:products", "admin:orders", "admin:stats", "admin:help"):
-            return await admin_message({"chat": {"id": chat}, "text": "/" + data.split(":")[1]}, request_key)
-        if data.startswith("catalog:"):
-            return await catalog(chat, int(data.split(":")[1]), True)
-        return await admin_panel(chat)
+        return await ui.admin_callback(chat, data, request_key)
+    if await ui.customer_callback(chat, data):
+        return
     if data.startswith("catalog:"):
         return await catalog(chat, int(data.split(":")[1]))
     if data in ("payments", "currencies"):
@@ -2274,8 +2010,8 @@ async def handle(update, admin):
             await bot.send(
                 user,
                 "Telegram rejected that action. "
-                "Check the command and bot permissions; "
-                "use /support for payment problems.",
+                "Check the upload and bot permissions, then try again.",
+                keyboard([("← Admin menu", "admin:menu")]) if admin else home_buttons(),
             )
 
     except (ValueError, ArithmeticError) as error:
@@ -2286,6 +2022,7 @@ async def handle(update, admin):
                 if isinstance(error, ValueError)
                 else "Invalid number."
             ),
+            keyboard([("✖ Cancel / menu", "ui:cancel")]) if admin else keyboard([("✖ Cancel / store", "home")]),
         )
 
 
@@ -2385,7 +2122,7 @@ async def worker():
                     """
                     INSERT INTO jobs(
                         dedup,target,chat,text,
-                        marketing,expires
+                        marketing,expires,buttons
                     )
                     SELECT
                         $1||':'||id::text,
@@ -2396,17 +2133,15 @@ async def worker():
                         (
                             (now() AT TIME ZONE 'UTC')::date
                             + 1
-                        )::timestamp AT TIME ZONE 'UTC'
+                        )::timestamp AT TIME ZONE 'UTC',
+                        $3::jsonb
                     FROM users
                     WHERE alerts AND NOT blocked
                     ON CONFLICT(dedup) DO NOTHING
                     """,
                     "daily:" + moment.strftime("%Y-%m-%d"),
-                    (
-                        reminder["text"]
-                        + "\n\n/products • "
-                        "/stop to unsubscribe."
-                    ),
+                    reminder["text"],
+                    json.dumps(keyboard([("Browse products", "catalog:0"), ("Disable reminders", "alerts:off")])),
                 )
 
                 last_scheduled_minute = moment.strftime("%Y-%m-%d %H:%M")
@@ -2472,6 +2207,7 @@ async def worker():
                     await bot.send(
                         job["chat"],
                         job["text"],
+                        json.loads(job["buttons"]) if isinstance(job["buttons"], str) else job["buttons"],
                     )
 
                 await db.execute(
@@ -2547,126 +2283,12 @@ async def worker():
 async def payment_worker():
     while True:
         try:
-            rows = await db.fetch(
-                """
-                SELECT * FROM orders
-                WHERE asset IS NOT NULL
-                  AND txid IS NOT NULL
-                  AND status='pending'
-                ORDER BY id
-                """
-            )
-
-            for order in rows:
-                try:
-                    valid = await crypto.verify(order)
-
-                    if valid:
-                        async with db.acquire() as conn:
-                            async with conn.transaction():
-                                fresh = await conn.fetchrow(
-                                    """
-                                    SELECT * FROM orders
-                                    WHERE id=$1 FOR UPDATE
-                                    """,
-                                    order["id"],
-                                )
-
-                                if (
-                                    fresh["status"] == "pending"
-                                    and fresh["txid"]
-                                    == order["txid"]
-                                ):
-                                    claimed = await conn.fetchval(
-                                        """
-                                        INSERT INTO payments(
-                                            asset,txid,order_id
-                                        )
-                                        VALUES($1,$2,$3)
-                                        ON CONFLICT DO NOTHING
-                                        RETURNING order_id
-                                        """,
-                                        order["asset"],
-                                        order["txid"],
-                                        order["id"],
-                                    )
-
-                                    if claimed:
-                                        await mark_paid(
-                                            conn,
-                                            fresh,
-                                        )
-
-                    elif (
-                        now() - order["expires"]
-                    ).total_seconds() > 86400:
-                        async with db.acquire() as conn:
-                            async with conn.transaction():
-                                result = await conn.fetchval(
-                                    """
-                                    UPDATE orders
-                                    SET status='needs_review'
-                                    WHERE id=$1
-                                      AND status='pending'
-                                    RETURNING id
-                                    """,
-                                    order["id"],
-                                )
-
-                                if result:
-                                    await alert_admins(
-                                        conn,
-                                        (
-                                            "crypto-review:"
-                                            f"{order['id']}"
-                                        ),
-                                        (
-                                            f"Crypto order "
-                                            f"#{order['id']} was "
-                                            "not verified within "
-                                            "24h after expiry. "
-                                            "Investigate the "
-                                            "transaction; do not "
-                                            "request another "
-                                            "payment before "
-                                            "checking."
-                                        ),
-                                    )
-
-                                    await queue(
-                                        conn,
-                                        (
-                                            "crypto-review-user:"
-                                            f"{order['id']}"
-                                        ),
-                                        "main",
-                                        order["user_id"],
-                                        (
-                                            f"Order #{order['id']} "
-                                            "needs payment review. "
-                                            "/support"
-                                        ),
-                                    )
-
-                except Exception as error:
-                    LOG.warning(
-                        "Crypto order %s: %s",
-                        order["id"],
-                        type(error).__name__,
-                    )
-
-                await asyncio.sleep(1)
-
+            await ui.scan_cycle()
         except asyncio.CancelledError:
             raise
-
         except Exception as error:
-            LOG.warning(
-                "Payment worker: %s",
-                type(error).__name__,
-            )
-
-        await asyncio.sleep(60)
+            LOG.warning("Payment worker: %s", type(error).__name__)
+        await asyncio.sleep(45)
 
 
 async def keep_lock(connection):
@@ -2723,7 +2345,7 @@ async def main():
         async with db.acquire() as connection:
             async with connection.transaction():
                 await connection.execute("SELECT pg_advisory_xact_lock(9173003)")
-                await connection.execute(SCHEMA)
+                await connection.execute(SCHEMA + UI_SCHEMA)
         for env_name, prefix in [("LOCAL_PAYMENTS_JSON", "method:"), ("FX_RATES_JSON", "rate:")]:
             for code, value in json.loads(os.getenv(env_name, "{}")).items():
                 if code not in CURRENCIES:
@@ -2756,7 +2378,7 @@ async def main():
                     return
                 runtime["role"] = "running"
                 LOG.info("SnowmanBot started | %s", VERSION)
-                tasks = [asyncio.create_task(coro) for coro in (poll(False), poll(True), worker(), payment_worker(), keep_lock(leader))]
+                tasks = [asyncio.create_task(coro) for coro in (poll(False), poll(True), worker(), payment_worker(), ui.timers(), keep_lock(leader))]
                 shutdown = asyncio.create_task(stop.wait())
                 tasks.append(shutdown)
                 try:
@@ -2778,6 +2400,9 @@ async def main():
             except Exception:
                 db.terminate()
         await runner.cleanup()
+
+
+ui = StoreUI(sys.modules[__name__])
 
 
 if __name__ == "__main__":
