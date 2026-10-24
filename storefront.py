@@ -355,6 +355,9 @@ class StoreUI:
         if len(rows)>8: items.append(('Next →', f'ui:products:{page+1}'))
         await self.send(chat, '📦 Products\nChoose a product to edit its name, price, description, image or delivery.', [('➕ Add product', 'admin:add')] + items + MENU)
 
+    async def extra_product_buttons(self, product):
+        return []
+
     async def product_detail(self, chat, pid):
         product = await self.b.db.fetchrow('SELECT * FROM products WHERE id=$1', pid)
         if not product: raise ValueError('Product not found.')
@@ -362,6 +365,7 @@ class StoreUI:
             await self.b.admin_bot.call('sendPhoto', chat_id=chat, photo=('product.jpg', product['image']))
         items = [(label, f'ui:edit:{pid}:{field}') for label, field in [('✏️ Name', 'name'), ('💰 Price', 'price'), ('📝 Description', 'description'), ('🖼 Image', 'image')]]
         if product['kind'] == 'digital': items.append(('📎 Digital delivery', f'ui:edit:{pid}:delivery'))
+        items += await self.extra_product_buttons(product)
         items += [('⏸ Hide from store' if product['published'] else '✅ Publish product', f"ui:publish:{pid}:{'hide' if product['published'] else 'show'}"), ('← Products', 'ui:products:0')]
         currency = 'XTR' if product['kind'] == 'digital' else 'USD'
         await self.send(chat, f"#{pid} {product['name']}\n{'Published' if product['published'] else 'Draft'} · {self.b.format_amount(product['price'], currency)}\n\n{product['description']}", items)
@@ -396,6 +400,9 @@ class StoreUI:
         else:
             await self.send(chat, '🧾 Orders & payment review' if rows else 'No orders yet.', items+MENU)
 
+    async def extra_order_buttons(self, order):
+        return []
+
     async def order_detail(self, chat, oid):
         o = await self.b.db.fetchrow('SELECT * FROM orders WHERE id=$1', oid)
         if not o: raise ValueError('Order not found.')
@@ -413,6 +420,7 @@ class StoreUI:
         if o['status'] == 'paid': items.append(('🚚 Mark delivered / tracking', f'ui:fulfill:{oid}'))
         if o['method'] == 'stars' and o['status'] in ('paid', 'fulfilled', 'refunding'):
             items.append(('↩️ Refund Stars', f'ui:refundask:{oid}'))
+        items += await self.extra_order_buttons(o)
         await self.send(chat, text, items+[('← Orders', 'ui:orders:0')])
 
     async def decide(self, conn, admin_id, data):
@@ -570,7 +578,7 @@ class StoreUI:
     async def show_order(self, chat, order):
         o = dict(order)
         bank = None
-        if o['method'] == 'local':
+        if o['method'] == 'local' and o.get('bank_released', True):
             snapshot = await self.b.db.fetchrow('SELECT * FROM order_bank_details WHERE order_id=$1', o['id'])
             if snapshot:
                 bank = unpack(snapshot['data'])

@@ -16,6 +16,7 @@ import asyncpg
 
 from crypto import ASSETS, Crypto, ton_address, tx_hash
 from storefront import StoreUI, UI_SCHEMA
+from fulfillment import FulfillmentUI, FULFILLMENT_SCHEMA, quote_usd
 
 
 logging.basicConfig(
@@ -35,7 +36,7 @@ def parse_admin_ids(raw):
 
 ADMINS = parse_admin_ids(os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID", ""))
 BOT_IDS = {}
-VERSION = "snowman-2026-10-24-buttons-payments"
+VERSION = "snowman-2026-10-24-location-delivery"
 
 
 CURRENCIES = sorted(
@@ -340,14 +341,16 @@ def home_buttons():
         ("📦 My orders", "myorders"),
         ("🔔 Enable reminders & alerts", "alerts:on"),
         ("🔕 Disable reminders & alerts", "alerts:off"),
-        ("🚚 Delivery details", "deliverydetails"),
+        ("📍 Drop-off map point", "deliverydetails"),
+        ("🌍 Country profile", "countries:0"),
+        ("🏪 Vendors", "vendors:0"),
         ("💬 Support", "support"),
     ])
 
 
 def enabled_crypto():
     return [asset for asset in ASSETS
-            if os.getenv(f"{asset}_ADDRESS", "").strip()
+            if asset != "TON" and os.getenv(f"{asset}_ADDRESS", "").strip()
             and (asset not in ("ETH", "SOL") or os.getenv(f"{asset}_RPC_URL", "").strip())]
 
 
@@ -376,7 +379,7 @@ async def local_currency_menu(chat, product_id=0, page=0):
     for code in selected:
         label = CURRENCY_LABELS.get(code, code)
         if product:
-            total = (product["price"]*methods[code][1]).quantize(currency_quantum(code), rounding=ROUND_UP)
+            total = (quote_usd(product["price"])[2]*methods[code][1]).quantize(currency_quantum(code), rounding=ROUND_UP)
             label += " — " + format_amount(total, code)
         buttons.append((label, f"bank:{product_id}:{code}" if product_id else f"currency:{code}"))
     if page:
@@ -402,7 +405,9 @@ async def crypto_menu(chat, product_id):
         + [("← Payment methods", back)]))
 
 
-async def begin_checkout(chat, product_id, method, request_key, currency=None):
+async def begin_checkout(chat, product_id, method, request_key, currency=None, delivery_ready=False):
+    if not delivery_ready:
+        return await ui.start_checkout(chat, product_id, method, request_key, currency)
     product = await db.fetchrow("SELECT * FROM products WHERE id=$1 AND published", product_id)
     if not product:
         raise ValueError("Product unavailable.")
@@ -411,10 +416,9 @@ async def begin_checkout(chat, product_id, method, request_key, currency=None):
             raise ValueError("This bank-transfer option is unavailable. Choose another payment method.")
         if method != "local" and method not in enabled_crypto():
             raise ValueError("This payment method is unavailable.")
-        shipping = await db.fetchval("SELECT shipping FROM users WHERE id=$1", chat)
-        if not shipping:
-            await state(chat, {"shipping": product_id, "checkout": {"method": method, "currency": currency}})
-            return await main_bot.send(chat, "Send your name, phone number, country and full delivery address in one message.", keyboard([("✖ Cancel", "home")]))
+        user = await db.fetchrow("SELECT * FROM users WHERE id=$1", chat)
+        if not user or not user["shipping"]:
+            raise ValueError("Choose your drop-off point and delivery time first.")
     elif method != "stars":
         raise ValueError("This digital product uses Telegram Stars.")
     order = await create_order(chat, product_id, method, request_key, local_currency=currency)
@@ -527,10 +531,17 @@ async def product_card(chat, product, admin=False):
         )
     )
 
+    if product["kind"] == "physical":
+        subtotal, discount, total = quote_usd(product["price"])
+        text += "\n\nPhysical delivery to an agreed map point. Choose a delivery time at checkout."
+        if discount:
+            text += f"\n$150 order discount · Total: {format_amount(total, 'USD')}"
     await bot.send(chat, text, buttons)
 
 
 async def catalog(chat, offset=0, admin=False):
+    if not admin:
+        return await ui.catalog(chat, offset)
     rows = await db.fetch(
         """
         SELECT *
@@ -573,7 +584,7 @@ async def payment_menu(chat, product_id=0):
         if product["kind"] == "digital":
             return await main_bot.send(chat, f"{product['name']}\n{format_amount(product['price'], 'XTR')}", keyboard([
                 ("⭐ Pay with Stars", f"pay:{product_id}:stars"), ("← Products", "catalog:0")]))
-    title = f"{product['name']}\n{format_amount(product['price'], 'USD')}\n\n" if product else ""
+    title = f"{product['name']}\n{format_amount(quote_usd(product['price'])[2], 'USD')}" + (" after $150 discount" if quote_usd(product['price'])[1] else "") + "\nPhysical location-drop delivery. Choose a delivery time at checkout.\n\n" if product else ""
     await main_bot.send(chat, title + "How would you like to pay?", keyboard([
         ("🪙 Cryptocurrency", f"crypto:{product_id}"),
         ("🏦 Local bank transfer", f"local:{product_id}:0"),
@@ -614,6 +625,9 @@ async def create_order(
 
     if not product:
         raise ValueError("Product unavailable.")
+
+    if product["kind"] == "physical" and product["country"] and product["country"] != user["country"]:
+        raise ValueError("This product is not listed for your selected country.")
 
     asset = None
     units = None
@@ -665,7 +679,7 @@ async def create_order(
             )
 
             amount = (
-                product["price"] * positive(rate)
+                quote_usd(product["price"])[2] * positive(rate)
             ).quantize(
                 quantum,
                 rounding=ROUND_UP,
@@ -707,7 +721,7 @@ async def create_order(
 
             base_units = int(
                 (
-                    product["price"] / price * scale
+                    quote_usd(product["price"])[2] / price * scale
                 ).to_integral_value(
                     rounding=ROUND_UP
                 )
@@ -822,6 +836,7 @@ async def create_order(
 
             if method == "local":
                 await ui.snapshot_bank(conn, order, account=payment_bank)
+            order = await ui.snapshot_delivery(conn, order, product, user)
 
     return order
 
@@ -1684,6 +1699,9 @@ async def customer_message(message):
 
     pending = json.loads(user["state"]) if isinstance(user["state"], str) else dict(user["state"] or {})
 
+    if await ui.customer_command(message):
+        return
+
     if not cmd.startswith("/") and "shipping" not in pending and await ui.customer_input(message, pending):
         return
 
@@ -1943,7 +1961,7 @@ async def handle(update, admin):
         return
 
     query = update.get("callback_query")
-    message = update.get("message")
+    message = update.get("message") or update.get("edited_message")
     item = query or message
 
     if not item or not item.get("from"):
@@ -1975,6 +1993,15 @@ async def handle(update, admin):
                 pass
         await bot.send(user, f"🔒 Admin access is not enabled for this account.\nYour Telegram user ID: {user}\n\nStore owner: add this numeric USER ID to ADMIN_IDS in your hosting environment, then deploy the updated variables. Use your personal user ID, not a bot ID or @username.")
         LOG.warning("Admin request denied: user is not in ADMIN_IDS")
+        return
+
+    if update.get("edited_message"):
+        if admin:
+            try:
+                await ui.handle_live_edit(message)
+            except TGError as error:
+                if error.code not in (400,403):
+                    raise
         return
 
     if not admin:
@@ -2057,6 +2084,7 @@ async def poll(admin):
                 timeout=40,
                 allowed_updates=[
                     "message",
+                    "edited_message",
                     "callback_query",
                     "pre_checkout_query",
                 ],
@@ -2146,6 +2174,8 @@ async def worker():
 
                 last_scheduled_minute = moment.strftime("%Y-%m-%d %H:%M")
 
+            await ui.schedule_backup(moment)
+
             job = await db.fetchrow(
                 """
                 UPDATE jobs SET status='sending'
@@ -2184,7 +2214,19 @@ async def worker():
                     continue
 
             try:
-                if job["target"] == "delivery":
+                if job["target"] == "backup":
+                    try:
+                        backup = await ui.export_backup()
+                    except ValueError as error:
+                        await db.execute("UPDATE jobs SET status='failed' WHERE id=$1", job["id"])
+                        await admin_bot.send(job["chat"], "Daily backup could not be exported: " + str(error), keyboard([("Backup options", "ful:backupask")]))
+                        continue
+                    await admin_bot.call("sendDocument", chat_id=job["chat"], document=("SnowmanBot_backup_" + now().strftime("%Y%m%d_%H%M%S") + ".zip", backup))
+                elif job["target"] == "bank_details":
+                    order = await db.fetchrow("SELECT * FROM orders WHERE id=$1", int(job["text"]))
+                    if order and order["bank_released"] and order["status"] in ("pending", "review", "expired", "needs_review"):
+                        await show_order(job["chat"], order)
+                elif job["target"] == "delivery":
                     order = await db.fetchrow(
                         "SELECT * FROM orders WHERE id=$1",
                         int(job["text"]),
@@ -2345,7 +2387,7 @@ async def main():
         async with db.acquire() as connection:
             async with connection.transaction():
                 await connection.execute("SELECT pg_advisory_xact_lock(9173003)")
-                await connection.execute(SCHEMA + UI_SCHEMA)
+                await connection.execute(SCHEMA + UI_SCHEMA + FULFILLMENT_SCHEMA)
         for env_name, prefix in [("LOCAL_PAYMENTS_JSON", "method:"), ("FX_RATES_JSON", "rate:")]:
             for code, value in json.loads(os.getenv(env_name, "{}")).items():
                 if code not in CURRENCIES:
@@ -2402,7 +2444,7 @@ async def main():
         await runner.cleanup()
 
 
-ui = StoreUI(sys.modules[__name__])
+ui = FulfillmentUI(sys.modules[__name__])
 
 
 if __name__ == "__main__":
