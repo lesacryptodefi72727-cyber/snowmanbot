@@ -33,7 +33,7 @@ def parse_admin_ids(raw):
 
 ADMINS = parse_admin_ids(os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID", ""))
 BOT_IDS = {}
-VERSION = "snowman-2026-10-24-checkout-fix"
+VERSION = "snowman-2026-10-24-product-form"
 
 
 CURRENCIES = sorted(
@@ -81,6 +81,15 @@ CREATE TABLE IF NOT EXISTS products (
     filename TEXT,
     delivery TEXT NOT NULL DEFAULT '',
     published BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE TABLE IF NOT EXISTS admin_product_drafts (
+    admin_id BIGINT PRIMARY KEY,
+    token TEXT NOT NULL,
+    state JSONB NOT NULL,
+    image BYTEA,
+    file BYTEA,
+    filename TEXT
 );
 
 CREATE TABLE IF NOT EXISTS orders (
@@ -1007,6 +1016,118 @@ Configure payment details before publishing.
 """
 
 
+async def product_wizard(chat, action=None, message=None):
+    """Persistent, private admin product editor; authorization is checked by handle."""
+    row = await db.fetchrow("SELECT * FROM admin_product_drafts WHERE admin_id=$1", chat)
+    if action == "start":
+        if not row:
+            await db.execute("INSERT INTO admin_product_drafts(admin_id,token,state) VALUES($1,$2,$3::jsonb) ON CONFLICT DO NOTHING", chat, secrets.token_hex(6), json.dumps({"step": "kind"}))
+            row = await db.fetchrow("SELECT * FROM admin_product_drafts WHERE admin_id=$1", chat)
+    if not row:
+        if action:
+            await admin_bot.send(chat, "This product form has closed. Tap Add product to start again.")
+        return False
+    state = json.loads(row["state"]) if isinstance(row["state"], str) else dict(row["state"])
+    token = row["token"]
+    image_bytes, file_bytes, filename = row["image"], row["file"], row["filename"]
+    def buttons(items):
+        return keyboard([(label, f"form:{token}:{value}") for label, value in items])
+    if action and action != "start":
+        supplied, action = action.split(":", 1)
+        if supplied != token:
+            await admin_bot.send(chat, "That button belongs to an older product form. Open Add product to resume the current one.")
+            return True
+        if action == "cancel":
+            await db.execute("DELETE FROM admin_product_drafts WHERE admin_id=$1 AND token=$2", chat, token)
+            await admin_bot.send(chat, "Product form cancelled. Nothing published.")
+            await admin_panel(chat)
+            return True
+        if action in ("physical", "digital") and state["step"] == "kind":
+            state.update(kind=action, step="name")
+        elif action.startswith("edit_") and state["step"] == "review":
+            field = action[5:]
+            if field not in ("name", "price", "description", "image", "delivery") or (field == "delivery" and state["kind"] != "digital"):
+                raise ValueError("Choose a field from the product preview.")
+            state.update(step=field, editing=True)
+        elif action in ("draft", "publish") and state["step"] == "review":
+            # Unique form key makes retries/double taps safe, including after a restart.
+            async with db.acquire() as conn:
+                async with conn.transaction():
+                    pid = await conn.fetchval("""INSERT INTO products(request_key,kind,name,price,description,image,file,filename,delivery)
+                        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                        ON CONFLICT(request_key) DO UPDATE SET request_key=EXCLUDED.request_key RETURNING id""",
+                        f"wizard:{chat}:{token}", state["kind"], state["name"], positive(state["price"]), state["description"], image_bytes, file_bytes, filename, state.get("delivery", ""))
+                    if action == "publish":
+                        await conn.execute("UPDATE products SET published=true WHERE id=$1", pid)
+                        await conn.execute("""INSERT INTO jobs(dedup,target,chat,text,marketing)
+                            SELECT 'product:'||$1::text||':'||id::text,'main',id,$2,true FROM users
+                            WHERE alerts AND NOT blocked ON CONFLICT(dedup) DO NOTHING""", str(pid),
+                            f"New product: {state['name']}\nOpen /product {pid} to see it.\n/stop to unsubscribe.")
+                    await conn.execute("DELETE FROM admin_product_drafts WHERE admin_id=$1 AND token=$2", chat, token)
+            await admin_bot.send(chat, f"✅ Product #{pid} {'published' if action == 'publish' else 'saved as a draft'}.", keyboard([("➕ Add another product", "admin:add"), ("📦 Products", "admin:products"), ("← Admin menu", "admin:menu")]))
+            return True
+        elif action not in ("physical", "digital"):
+            await admin_bot.send(chat, "Use the buttons on the latest product prompt.")
+            return True
+    if message and (not message.get("message_id") or message["message_id"] != state.get("last_message")):
+        step = state["step"]
+        value = message.get("text", "").strip()
+        if step == "kind" or step == "review":
+            await admin_bot.send(chat, "Please choose a button below.")
+        else:
+            if step == "name":
+                if not 1 <= len(value) <= 80:
+                    raise ValueError("Send a product name of 1–80 characters.")
+                state["name"] = value
+            elif step == "price":
+                price = positive(value)
+                if state["kind"] == "digital" and (price != int(price) or price > 1000000):
+                    raise ValueError("Send a whole Stars amount from 1 to 1,000,000.")
+                state["price"] = str(price)
+            elif step == "description":
+                if not 1 <= len(value) <= 2500:
+                    raise ValueError("Send a description of 1–2,500 characters.")
+                state["description"] = value
+            elif step == "image":
+                if not message.get("photo"):
+                    raise ValueError("Send the product image as a Telegram photo (up to 5 MB).")
+                image_bytes = await admin_bot.download(message["photo"][-1]["file_id"], 5 * 1024 * 1024)
+            elif step == "delivery":
+                if message.get("document"):
+                    document = message["document"]
+                    file_bytes = await admin_bot.download(document["file_id"], 10 * 1024 * 1024)
+                    filename = document.get("file_name", "product.bin")
+                    state["delivery"] = ""
+                elif 1 <= len(value) <= 2500:
+                    state["delivery"] = value
+                    file_bytes, filename = None, None
+                else:
+                    raise ValueError("Send the digital file (up to 10 MB), or delivery text/link (up to 2,500 characters).")
+            next_step = {"name": "price", "price": "description", "description": "image", "image": "delivery" if state["kind"] == "digital" else "review", "delivery": "review"}
+            state["step"] = "review" if state.pop("editing", False) else next_step[step]
+    if message and message.get("message_id"):
+        state["last_message"] = message["message_id"]
+    await db.execute("UPDATE admin_product_drafts SET state=$2::jsonb,image=$3,file=$4,filename=$5 WHERE admin_id=$1", chat, json.dumps(state), image_bytes, file_bytes, filename)
+    step = state["step"]
+    cancel = [("✖ Cancel", "cancel")]
+    if step == "kind":
+        await admin_bot.send(chat, "➕ Add product\nWhat kind of product are you adding?", buttons([("📦 Physical product", "physical"), ("📲 Digital product", "digital")] + cancel))
+    elif step == "review":
+        await admin_bot.call("sendPhoto", chat_id=chat, photo=("product.jpg", image_bytes))
+        currency = "XTR" if state["kind"] == "digital" else "USD"
+        preview = f"Review your product\n\nName: {state['name']}\nPrice: {format_amount(positive(state['price']), currency)}\nType: {state['kind']}\n\n{state['description']}"
+        if state["kind"] == "digital":
+            preview += f"\n\nDelivery: {filename if file_bytes else state.get('delivery', '')[:300]}"
+        edits = [("✏️ Edit name", "edit_name"), ("💰 Edit price", "edit_price"), ("📝 Edit description", "edit_description"), ("🖼 Change image", "edit_image")]
+        if state["kind"] == "digital":
+            edits.append(("📎 Change delivery", "edit_delivery"))
+        await admin_bot.send(chat, preview, buttons([("✅ Save & publish", "publish"), ("💾 Save as draft", "draft")] + edits + cancel))
+    else:
+        prompts = {"name": "Send the product name.", "price": "Send the price in whole Telegram Stars." if state.get("kind") == "digital" else "Send the product price in USD, for example 12.50. Local bank checkout converts using your configured rates.", "description": "Send a short product description.", "image": "Upload the product image as a photo. No caption or command needed.", "delivery": "Send the digital file to deliver after payment, or send the delivery text/link."}
+        await admin_bot.send(chat, prompts[step], buttons(cancel))
+    return True
+
+
 async def admin_message(message, request_key):
     chat = message["chat"]["id"]
 
@@ -1025,6 +1146,13 @@ async def admin_message(message, request_key):
     if cmd == "/help":
         return await admin_bot.send(chat, ADMIN_HELP, keyboard([("← Admin menu", "admin:menu")]))
 
+    if cmd == "/cancel":
+        await db.execute("DELETE FROM admin_product_drafts WHERE admin_id=$1", chat)
+        return await admin_panel(chat)
+    if not cmd.startswith("/") and await product_wizard(chat, message=message):
+        return
+    if cmd == "/add" and not rest:
+        return await product_wizard(chat, action="start")
     if cmd == "/add":
         pieces = [
             value.strip()
@@ -1959,7 +2087,9 @@ async def callback(query, admin, request_key):
         if data == "admin:myid":
             return await bot.send(chat, f"Your Telegram user ID: {chat}")
         if data == "admin:add":
-            return await bot.send(chat, "Add a product using one of these formats:\n\n/add physical | Name | USD price | Description\n/add digital | Name | Stars price | Description\n\nThen send an image with caption /photo ID and publish using /publish ID.", keyboard([("← Admin menu", "admin:menu")]))
+            return await product_wizard(chat, action="start")
+        if data.startswith("form:"):
+            return await product_wizard(chat, action=data[5:])
         if data == "admin:settings":
             return await bot.send(chat, "Bank details: /method NGN | Your account details\nExchange rate: /rate NGN YOUR_RATE\nDaily reminder (UTC): /reminder 08:00 | Your message\nDisable reminder: /reminderoff\n\nOnly configured bank currencies appear to customers. Crypto wallet addresses remain in hosting variables.", keyboard([("← Admin menu", "admin:menu")]))
         if data in ("admin:products", "admin:orders", "admin:stats", "admin:help"):
