@@ -1,137 +1,154 @@
-# SnowmanBot — location-drop delivery release
+# SnowmanBot — general store release
 
-Version: `snowman-2026-10-24-location-delivery`
+Version: `snowman-2026-10-25-general-store`
 
-This update implements the two supplied screenshots: physical delivery to a map point, requested delivery times, private admin/customer bank coordination, a $150 discount above $1,000, product browsing, country profiles, an upcoming/verified vendor directory, backups, and removal of TON from new checkouts.
+This release implements the latest five screenshots. It removes the country selector, country labels such as Ghana, and country-specific product/vendor navigation. Customers use one shared store, see physical-product prices in USD, enter their city and a map pin, and contact support for local bank details. Country/vendor expansion is paused for a later phase.
 
-## Deploy the complete release
+The target markets are Oman, Saudi Arabia, United Arab Emirates, Bahrain, Kuwait and Qatar. The app does not invent local vendors or claim a staff location. Delivery availability and ETA are confirmed by support for the customer's city.
 
-Extract the ZIP. Upload **all seven application files** to the root of your GitHub repository, replacing the existing files and adding the new ones:
+## Upload and deploy
+
+Extract the ZIP and upload **all seven application files** to the root of your GitHub repository:
 
 1. `bot.py`
 2. `crypto.py`
 3. `storefront.py`
-4. `fulfillment.py` — new and required
-5. `restore_backup.py` — new backup restoration utility
+4. `fulfillment.py`
+5. `restore_backup.py`
 6. `requirements.txt`
 7. `Dockerfile`
 
-Also upload this `README.md`. Upload the extracted files, not the ZIP itself and not text copied from a preview. The Dockerfile checks Python syntax during build.
+Also upload this README. Replace the existing files, commit and deploy the latest commit. Upload files from the extracted ZIP, not the ZIP itself or code copied from a preview.
 
-Keep the same PostgreSQL database and existing hosting variables. Commit and deploy the latest version. The additive schema migration preserves products, users, orders, images, receipts and payment settings. On Render, keep `/health` as the health-check path and use one running replica for the two bots.
+Keep the existing PostgreSQL database and hosting variables. The schema adds city and editable-media storage without deleting products, customers, orders, receipts or legacy settings. Archived country tags no longer filter the store. On Render, use `/health` and one running replica for the two bots.
 
-## Customer flow
+After deployment, open the admin bot and press **Start**. Its menu must show:
 
-- Customers can **Browse products** without starting an order.
-- The home screen explains physical location-drop delivery. It is not home delivery.
-- The **Country profile** button chooses the country storefront. Products assigned to a country are listed in that profile; products set to **All country profiles** remain visible everywhere. Country selection does not promise coverage: the store confirms delivery availability.
-- After choosing a physical product and payment method, the customer sends a Telegram map pin. Use attachment → Location to choose a drop-off point. The current-location button is optional and should only be used when that is the intended drop-off point.
-- The customer chooses **As soon as available** or a requested date/time, reviews the map point, total and requested time, then confirms checkout.
-- Requested delivery slots cover the next seven days, with hourly options from 08:00 to 22:00. The admin confirms availability and the final ETA.
-- The order keeps its own snapshot of country, map point, requested time, subtotal and discount. Changing a profile later does not move an existing order.
+```text
+Version: snowman-2026-10-25-general-store
+```
 
-`DELIVERY_TIMEZONE` controls delivery scheduling. Default: `Africa/Lagos`. The timezone is shown in the prompts and time labels. Daily reminders and backup scheduling use UTC separately.
+The startup log and `/health` response also include that version. If you still see the old version, the previous code is still deployed. Old Telegram message bubbles remain in chat history; open the new store menu to see the updated content. Old country buttons redirect into the general store/city flow.
 
-## Discount
+## Customer experience
 
-A physical order with a USD subtotal **strictly greater than $1,000** receives **$150 off** before local-currency or crypto conversion.
+- The welcome message has no country suffix or country selector.
+- **Browse products** shows published products, photos and USD prices without creating an order. Archived regional tags do not hide products.
+- Physical-product payment options are crypto or **Bank transfer — contact support**.
+- A physical checkout asks for the **city**, then a **map pin**. There is no country-selection step.
+- The customer chooses **Same-day / as soon as available**, or types a preferred delivery time in the city's local time. Support confirms the available time and ETA. No country or timezone picker is required.
+- The customer reviews the city, map point, requested time, discount and USD total before confirming.
+- A previous saved city/map point can be reused.
+- **Delivery & refund policy** and support are available from the main menu and order screens.
 
-| Subtotal | Discount | Total before currency conversion |
+Default delivery text:
+
+> Same-day delivery in supported cities. Delivery time depends on your city; support confirms availability and the ETA.
+
+Default store policy:
+
+> Delivery is guaranteed. If you do not receive the quality you ordered, contact support for a refund. Support arranges and processes refunds.
+
+These are editable store-policy statements. The app does not automatically send bank/crypto refunds. A paid-order **Request a refund** button opens a private support discussion. The operator must arrange and process refunds. Native Telegram Stars refunds remain available for eligible digital orders.
+
+## Your editable control panel
+
+Open the admin bot → **Start → Store content & appearance**.
+
+You can edit, preview and save:
+
+- Store display name.
+- Welcome message.
+- Delivery message.
+- Delivery/refund policy.
+- Support contact.
+- Welcome sticker or photo.
+
+Text changes have a preview and Save button. No command syntax is needed. This changes messages inside the store; the public Telegram profile name/bio/description are managed separately in BotFather.
+
+For a welcome sticker, choose **Upload welcome sticker / photo** and send a real Telegram sticker, including a static, animated or video sticker. For a welcome picture, upload a photo. The app stores the file bytes so the main bot can send it even though it was uploaded to the separate admin bot. Use **Preview welcome** to check it or **Remove welcome media** to clear it. No third-party sticker is silently selected: the operator chooses the visual.
+
+Use **Manage products** to change product names, prices, descriptions, photos, publishing status and digital delivery. A new product can be added through guided prompts and reviewed before publishing. Admin access is limited to `ADMIN_IDS`.
+
+## Bank payments without country/currency setup
+
+**No saved bank account or exchange rate is required for a customer to request bank payment.**
+
+1. The customer taps **Bank transfer — contact support**.
+2. The admin receives a notification immediately, with a **Message customer** button.
+3. The customer is told: **Message support for local bank details**. They can message support before completing checkout.
+4. Their order total remains in USD. Support agrees the bank, any local-currency transfer amount and payment instructions directly with the customer.
+5. After an order is created, open it under **Orders, payments & delivery**. Choose **Write bank instructions**, or **Choose bank template**.
+6. Review and explicitly send the details. Only then does the customer's order page show the account instructions/image and native Copy account button.
+7. The customer uploads a payment screenshot through **Upload receipt**, without a caption command.
+8. Check the actual bank receipt of funds, then use **Mark payment received** or **Decline payment**, add a review note and confirm.
+
+Private templates can be saved for USD, OMR, SAR, AED, BHD, KWD or QAR under **Saved bank templates**. No exchange-rate field is required. Templates are not automatically published and do not change the USD order price. If a transfer is to be made in another currency, explicitly agree that local amount with the customer. The Copy USD order total button is labelled so it is not confused with a local transfer amount.
+
+Older bank/rate data is preserved for historical orders but is not required by the new checkout.
+
+## USD pricing and discount
+
+Physical order prices are in USD. A physical subtotal **strictly greater than $1,000** gets **$150 off**, before crypto conversion.
+
+| Subtotal | Discount | USD total |
 |---|---|---|
 | $1,000.00 | $0.00 | $1,000.00 |
 | $1,000.01 | $150.00 | $850.01 |
 | $1,200.00 | $150.00 | $1,050.00 |
 
-Each checkout currently purchases one product; the threshold applies to that order's subtotal. Digital products continue to use Telegram Stars and do not receive a USD discount. Exact crypto invoice amounts may include the small atomic-unit adjustment used to identify the invoice.
+Each checkout currently purchases one product. Digital products continue to use Telegram Stars under their existing payment flow. Crypto checkout displays the USD order value together with the exact coin/token amount to send.
 
-## Bank transfers are coordinated manually
+## Crypto
 
-Customers are not automatically shown your bank account information.
+Supported new payments: **USDT on TRC20/TRON, BTC, SOL and ETH**. TON remains removed from new payment options. Historical TON orders can still be reviewed and verified so funds already sent are not abandoned.
 
-1. Set up a currency, bank and exchange rate under **Bank accounts & rates**. A valid rate is needed to quote the amount. Stored details are private until you send them for an order.
-2. When a customer chooses bank transfer, the admin receives a notification with a **Message customer** button.
-3. After the customer confirms the map point and requested time, open the order under **Orders, payments & delivery**.
-4. Use **Message customer** to discuss the transfer. Customer replies are relayed to the admin bot.
-5. Choose **Send saved bank details**, review the details, then confirm sending. Alternatively, choose **Write bank instructions**, enter the instructions and copyable account number, optionally attach an image, review, then send.
-6. Only after admin release does the customer's payment page show the bank text/image and native Copy account button. The customer can then upload a receipt without a caption command.
-7. Check your bank and use **Mark payment received** or **Decline payment**, enter a review note and confirm.
+Active crypto quotes include an address QR, native copy-address/copy-amount buttons and a 30-minute countdown. The QR contains the address; customers enter the copied exact amount on the stated network and pay network fees separately. The chat countdown refreshes roughly every 15 seconds while the service is running.
 
-Bank details, country and prices are snapshotted for an order. Changing the master bank setup does not silently change instructions already attached to an order. Bank details are not sent by a delayed notification after an order has already been paid.
+Public/free-tier APIs discover candidate payments, which are verified separately for receiving address, exact atomic amount, correct network/token, transaction success, invoice timing and confirmations. Bitcoin requires 3 confirmations, Ethereum 12, Solana finalization, and TRC20 USDT a confirmed official-token transfer. The app notifies the customer when payment is confirmed. A known hash can still be checked if a public history index is delayed. Hash submission and receipt upload remain available for review.
 
-## Delivery map and ETA
+Manual crypto approval needs a transaction hash and prevents reusing an already credited transaction. It is labelled as an admin decision, not network verification. A screenshot alone never automatically confirms a deposit. Free API availability/rate limits affect detection timing; no paid QR/deposit API is required by the code. `COINGECKO_API_KEY` remains optional for price conversion, with a free Demo key available if needed.
 
-Open a paid physical order:
+## Delivery tracking
 
-- **View drop-off point** displays the customer's chosen map pin.
-- **Set / update ETA** sends the confirmed time to the customer and saves it on the order. Include date and timezone in your message.
-- **Share delivery location** asks you to attach a location in the admin chat. A normal map pin sends a one-time map update. For actual movement, use Telegram attachment → Location → **Share Live Location**.
-- Live tracking relays edits to that specific authorised admin message to the customer's live map. No GPS location is invented or inferred. Updates continue only while the actual source live location is shared and its period remains active.
-- **Stop live tracking** ends the customer live map. Stopping the source live location also ends the customer map on the next edit update.
-- **Mark delivered / tracking** records fulfillment information for a paid order.
+On a paid physical order, the admin can view the customer's drop-off pin, set/update the confirmed ETA, share a delivery map point or share a real Telegram live location. A static pin is labelled a one-time update. A real live location is relayed only from the authorised admin's specific source message, and subsequent edited-message updates move the customer's map.
 
-Only IDs in `ADMIN_IDS` can operate delivery updates. This release does not provide a separate courier-role account; an approved admin shares the delivery location.
+Use Telegram attachment → Location → **Share Live Location** when genuine movement is needed. No GPS position is generated. **Stop live tracking** ends the map; stopping the source live sharing also stops the customer map on the next update. Only IDs in `ADMIN_IDS` can operate this; there is no separate courier-role account in this release.
 
-## Crypto payments
+## Backups
 
-New checkouts offer **USDT (TRC20/TRON), BTC, SOL and ETH** when their receiving wallets and required RPCs are configured. **TON is removed from new payment menus**, including stale pay buttons. Historical TON orders remain available for deposit verification and review, so funds already sent are not abandoned.
+**Export backup** sends an on-demand consistent database snapshot to the authorised admin chat. Private daily backups are also queued once per UTC day, at `02:00 UTC` by default. Configure `AUTO_BACKUP_UTC=HH:MM`, or `AUTO_BACKUP_UTC=off` to disable automatic exports. Admins must have started the admin bot.
 
-Active crypto quotes retain address QR codes, native Copy address / Copy exact amount buttons, a 30-minute countdown and payment confirmation notifications. The countdown refreshes roughly every 15 seconds while the service runs. The QR contains the address, not the amount. Use the stated network and exact amount; network fees are separate.
+Backups include products, customers, orders, receipts/images, city/map data, schedules, payment audit, private messages, bank templates, editable content and welcome media. Tokens, environment variables and private wallet keys are not exported. Keep downloaded backups, your code release and private variable configuration separately.
 
-The bot scans public/free-tier APIs for candidate payments, then verifies recipient, exact amount, network, success, timing and confirmations before crediting. It also supports hash submission and receipt upload. Public APIs can throttle or lag; a hash can still be verified if the history index is unavailable. Bitcoin needs 3 confirmations; Ethereum needs 12; Solana needs finalization; USDT needs a confirmed official TRC20 transfer. On-time transfers can finish confirming after the quote expires. Late or unverified transfers need review.
-
-Manual crypto approval requires a transaction hash and prevents using a previously credited transaction twice. Manual approval is labelled as an admin decision, not network confirmation. A screenshot alone never automatically confirms a payment.
-
-No paid QR or deposit API is required by the code. `COINGECKO_API_KEY` remains optional for USD conversion; a free Demo key can help when keyless pricing is throttled.
-
-## Country profiles and vendors
-
-This implements the **one bot with a country selector** option from the screenshots. It does not create separate Telegram bots or separate database tenants for each country.
-
-Use **Manage products → product → Set country profile** to limit a listing to a country, or choose all country profiles.
-
-Use **Vendors** in the admin panel to add a real vendor name, country, public contact and description. Vendors start as **Upcoming**. After your own checks, explicitly mark one **Verified by SnowmanBot**. This is your store's approval label, not Telegram verification or an external identity check. You can hide a vendor later. Customer directories follow the selected country profile and show global vendors too. An empty directory says it is coming soon; no invented vendors are seeded.
-
-## Backups and recovery
-
-**Export backup** in the admin panel creates a consistent PostgreSQL snapshot and sends the ZIP to the authorised admin chat. It includes products, users, orders, receipts/images, bank settings, map points, schedules, payment audit, messages and vendors. Environment variables, bot tokens and private wallet keys are not exported.
-
-A private daily backup is queued once per UTC day for each authorised admin. Default time: `02:00 UTC` (03:00 in Nigeria). If the service starts later that day, it queues that day's backup on startup. Set `AUTO_BACKUP_UTC=HH:MM` to change it, or `AUTO_BACKUP_UTC=off` to disable automatic exports. Admins must have started the admin bot. Uncertain/failed backup notifications can be deliberately retried through **Notification queue**; on-demand export remains available.
-
-Save your downloaded backups, this GitHub code release and private hosting-variable configuration separately. Telegram exports are limited to 40 MiB in this release; use your database provider's backup facility if the data grows larger.
-
-Inspect a downloaded backup:
+Inspect a backup:
 
 ```bash
 python restore_backup.py SnowmanBot_backup_YYYYMMDD_HHMMSS.zip --inspect
 ```
 
-Restore into an **empty** PostgreSQL database, with the bot service stopped and the destination `DATABASE_URL` set in your environment:
+Restore into an **empty** PostgreSQL database with the service stopped and the destination `DATABASE_URL` set in your environment:
 
 ```bash
 python restore_backup.py SnowmanBot_backup_YYYYMMDD_HHMMSS.zip --restore-empty
 ```
 
-The restore refuses a nonempty destination and does not delete existing data. Old queued notifications are paused for review, live-map sessions are disabled, and obsolete polling offsets are cleared. Reconfigure hosting variables, start the service and test the restored bot.
+The restore refuses a nonempty destination. It pauses old queued notifications and disables stale live-map sessions/polling offsets for review. The Telegram export is limited to 40 MiB compressed and 512 MiB of logical data; use a database-provider backup if larger.
 
-A backup preserves data and cannot reverse a Telegram account restriction. A replacement bot needs valid tokens, and customers must start that new bot before it can contact them. Backups do not recreate a banned username or let a new bot contact people automatically.
+Data backup cannot reverse a Telegram account restriction. A replacement bot needs valid tokens, and customers must start it before it can contact them. It does not restore a banned username.
 
-## Hosting variables
+## Hosting variables and operation
 
 Required: `MAIN_BOT_TOKEN`, `ADMIN_BOT_TOKEN`, `ADMIN_IDS`, `DATABASE_URL`.
 
-Use personal numeric Telegram user IDs in `ADMIN_IDS`. Customer/user IDs are distinct from bot IDs. Unapproved accounts can see only their own ID, not management actions.
+`ADMIN_IDS` contains personal numeric Telegram user IDs, not bot IDs or usernames. Wallets: `USDT_ADDRESS`, `BTC_ADDRESS`, `SOL_ADDRESS`, `ETH_ADDRESS`. Also configure `SOL_RPC_URL` and `ETH_RPC_URL` for the correct mainnets. Optional provider keys: `TRONGRID_API_KEY`, `COINGECKO_API_KEY`. Keep legacy TON variables only if historical payments need checking; they do not re-enable TON.
 
-Wallets: `USDT_ADDRESS`, `BTC_ADDRESS`, `SOL_ADDRESS`, `ETH_ADDRESS`. RPCs: `SOL_RPC_URL` for Solana mainnet and `ETH_RPC_URL` for Ethereum mainnet. Optional free-tier keys: `TRONGRID_API_KEY`, `COINGECKO_API_KEY`. Keep legacy `TON_ADDRESS` / `TONCENTER_API_KEY` if historical TON orders need checking; they do not re-enable TON for new purchases.
+`SUPPORT_CONTACT` is the initial support text; it can then be overridden through the admin content panel. `AUTO_BACKUP_UTC` defaults to `02:00`. `DELIVERY_TIMEZONE` defaults to `Asia/Dubai` for legacy time helpers; the new preferred-time prompt asks for the city's local time and relies on support confirmation. Daily reminders remain UTC and opt-in. Payment/order updates are independent of marketing subscriptions.
 
-Other settings:
+Legacy `LOCAL_PAYMENTS_JSON` and `FX_RATES_JSON` seeds are retained for compatibility. They no longer determine whether a customer can request bank payment.
 
-- `SUPPORT_CONTACT`: customer support contact.
-- `DELIVERY_TIMEZONE`: default `Africa/Lagos`.
-- `AUTO_BACKUP_UTC`: default `02:00`; use `off` to disable.
-- Legacy `LOCAL_PAYMENTS_JSON` / `FX_RATES_JSON` only seed missing settings. Use the admin bank forms to update accounts and rates.
-
-Reminders remain opt-in, use UTC and can be configured through **Daily reminder**. Payment/order messages are independent of marketing subscriptions. All polling, timers, scans, scheduled exports and reminders require a running service; an HTTP health endpoint does not keep an idle hosting plan awake.
+Polling, countdowns, deposit scans, reminders and scheduled backups require a running service. A health endpoint does not keep an idle hosting plan awake.
 
 ## Validation
 
-Local integration checks use an embedded PostgreSQL engine and simulated Telegram/network responses. They exercise migrations, map requirements, requested delivery slots, country restrictions, strict discount boundaries, manual bank release, messaging, receipt review, live-location edits, authorisation, vendor status, backup export and restore refusal on a nonempty database. Payment verification fixtures cover the current networks and legacy TON recovery. These are not live Telegram or real-money tests. Test the deployed bot in Telegram before opening it to customers.
+Local integration checks use embedded PostgreSQL and simulated Telegram/payment responses. They cover existing Ghana profiles, shared browsing with photos, USD checkout without bank/FX setup, city/map/preferences, stale buttons/forms, private bank release, editable policy/support content, welcome sticker/photo storage, authorisation, refund discussion, crypto checks, and backup/restore of the added content/media. These are not live Telegram or real-money tests. Test the deployed version in Telegram before opening it to customers.

@@ -36,7 +36,7 @@ def parse_admin_ids(raw):
 
 ADMINS = parse_admin_ids(os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID", ""))
 BOT_IDS = {}
-VERSION = "snowman-2026-10-24-location-delivery"
+VERSION = "snowman-2026-10-25-general-store"
 
 
 CURRENCIES = sorted(
@@ -46,7 +46,7 @@ CURRENCIES = sorted(
             "CDF DJF EGP ERN SZL ETB GMD GHS GNF XOF "
             "KES LSL LRD LYD MGA MWK MRU MUR MAD MZN "
             "NAD NGN RWF STN SCR SLE SOS ZAR SSP SDG "
-            "TZS TND UGX ZMW ZWG SHP"
+            "TZS TND UGX ZMW ZWG SHP OMR SAR AED BHD KWD QAR"
         ).split()
     )
 )
@@ -323,6 +323,8 @@ def currency_quantum(code):
 
 def format_amount(amount, currency):
     amount = Decimal(amount)
+    if currency == "USD":
+        return f"${amount:,.2f} USD"
     if currency == "XTR":
         return f"{int(amount):,} Stars"
     if currency in ASSETS:
@@ -342,8 +344,7 @@ def home_buttons():
         ("🔔 Enable reminders & alerts", "alerts:on"),
         ("🔕 Disable reminders & alerts", "alerts:off"),
         ("📍 Drop-off map point", "deliverydetails"),
-        ("🌍 Country profile", "countries:0"),
-        ("🏪 Vendors", "vendors:0"),
+        ("🛡 Delivery & refund policy", "policy"),
         ("💬 Support", "support"),
     ])
 
@@ -363,31 +364,7 @@ async def admin_panel(chat):
 
 
 async def local_currency_menu(chat, product_id=0, page=0):
-    methods = await local_methods()
-    codes = list(methods)
-    back = f"buy:{product_id}" if product_id else "payments"
-    if not codes:
-        return await main_bot.send(chat, "Local bank transfer is not available yet. Choose crypto or contact support.", keyboard([("← Back", back)]))
-    page = max(0, min(page, (len(codes)-1)//6))
-    selected = codes[page*6:page*6+6]
-    buttons = []
-    product = None
-    if product_id:
-        product = await db.fetchrow("SELECT * FROM products WHERE id=$1 AND published", product_id)
-        if not product or product["kind"] != "physical":
-            raise ValueError("This product does not support local bank transfer.")
-    for code in selected:
-        label = CURRENCY_LABELS.get(code, code)
-        if product:
-            total = (quote_usd(product["price"])[2]*methods[code][1]).quantize(currency_quantum(code), rounding=ROUND_UP)
-            label += " — " + format_amount(total, code)
-        buttons.append((label, f"bank:{product_id}:{code}" if product_id else f"currency:{code}"))
-    if page:
-        buttons.append(("← Previous", f"local:{product_id}:{page-1}"))
-    if (page+1)*6 < len(codes):
-        buttons.append(("Next →", f"local:{product_id}:{page+1}"))
-    buttons.append(("← Payment methods", back))
-    await main_bot.send(chat, "🏦 Local bank transfer\nChoose your country/currency:", keyboard(buttons))
+    return await ui.bank_help(chat, product_id)
 
 
 async def crypto_menu(chat, product_id):
@@ -412,6 +389,8 @@ async def begin_checkout(chat, product_id, method, request_key, currency=None, d
     if not product:
         raise ValueError("Product unavailable.")
     if product["kind"] == "physical":
+        if method == "local":
+            currency = "USD"
         if method == "local" and currency not in await local_methods():
             raise ValueError("This bank-transfer option is unavailable. Choose another payment method.")
         if method != "local" and method not in enabled_crypto():
@@ -587,7 +566,7 @@ async def payment_menu(chat, product_id=0):
     title = f"{product['name']}\n{format_amount(quote_usd(product['price'])[2], 'USD')}" + (" after $150 discount" if quote_usd(product['price'])[1] else "") + "\nPhysical location-drop delivery. Choose a delivery time at checkout.\n\n" if product else ""
     await main_bot.send(chat, title + "How would you like to pay?", keyboard([
         ("🪙 Cryptocurrency", f"crypto:{product_id}"),
-        ("🏦 Local bank transfer", f"local:{product_id}:0"),
+        ("🏦 Bank transfer — contact support", f"bankhelp:{product_id}"),
         ("← Products", "catalog:0"),
     ]))
 
@@ -626,9 +605,6 @@ async def create_order(
     if not product:
         raise ValueError("Product unavailable.")
 
-    if product["kind"] == "physical" and product["country"] and product["country"] != user["country"]:
-        raise ValueError("This product is not listed for your selected country.")
-
     asset = None
     units = None
     address = None
@@ -659,31 +635,11 @@ async def create_order(
             )
 
         if method == "local":
-            currency = local_currency or user["currency"]
-
-            payment_bank = (await ui.banks()).get(currency)
-            if not payment_bank or not payment_bank['ready']:
-                raise ValueError("This bank is not ready. Choose another payment method.")
-            rate = str(payment_bank['rate'])
-            note = ui.bank_text(payment_bank)
-
-            quantum = (
-                Decimal("1")
-                if currency in (
-                    "XAF", "XOF", "RWF", "BIF",
-                    "DJF", "GNF", "KMF", "UGX",
-                )
-                else Decimal("0.001")
-                if currency in ("TND", "LYD")
-                else Decimal("0.01")
-            )
-
-            amount = (
-                quote_usd(product["price"])[2] * positive(rate)
-            ).quantize(
-                quantum,
-                rounding=ROUND_UP,
-            )
+            # Bank transfers are arranged manually. USD is the order price;
+            # support agrees any local payment amount before releasing details.
+            currency = "USD"
+            note = ""
+            amount = quote_usd(product["price"])[2].quantize(Decimal("0.01"), rounding=ROUND_UP)
 
         elif method in ASSETS:
             asset = method
@@ -1849,7 +1805,7 @@ async def callback(query, admin, request_key):
         pass
     if admin:
         return await ui.admin_callback(chat, data, request_key)
-    if await ui.customer_callback(chat, data):
+    if await ui.customer_callback(chat, data, request_key):
         return
     if data.startswith("catalog:"):
         return await catalog(chat, int(data.split(":")[1]))

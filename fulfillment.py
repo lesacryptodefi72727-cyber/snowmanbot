@@ -17,6 +17,9 @@ from zoneinfo import ZoneInfo
 from storefront import StoreUI, OPEN, MENU, CANCEL, unpack
 
 FULFILLMENT_SCHEMA = """
+ALTER TABLE users ADD COLUMN IF NOT EXISTS city TEXT NOT NULL DEFAULT '';
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS city TEXT NOT NULL DEFAULT '';
+CREATE TABLE IF NOT EXISTS store_media (key TEXT PRIMARY KEY,kind TEXT NOT NULL CHECK(kind IN ('photo','sticker')),content BYTEA NOT NULL,filename TEXT NOT NULL);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS country TEXT NOT NULL DEFAULT '';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS dropoff JSONB NOT NULL DEFAULT '{}';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS delivery_schedule JSONB NOT NULL DEFAULT '{}';
@@ -61,79 +64,10 @@ CREATE TABLE IF NOT EXISTS vendors (
 """
 
 # Country profiles share one bot. Country names are display labels, not delivery guarantees.
-COUNTRIES = dict(line.split('|', 1) for line in '''NG|Nigeria
-GH|Ghana
-KE|Kenya
-ZA|South Africa
-DZ|Algeria
-AO|Angola
-BJ|Benin
-BW|Botswana
-BF|Burkina Faso
-BI|Burundi
-CV|Cabo Verde
-CM|Cameroon
-CF|Central African Republic
-TD|Chad
-KM|Comoros
-CG|Congo
-CD|DR Congo
-CI|Côte d'Ivoire
-DJ|Djibouti
-EG|Egypt
-GQ|Equatorial Guinea
-ER|Eritrea
-SZ|Eswatini
-ET|Ethiopia
-GA|Gabon
-GM|Gambia
-GN|Guinea
-GW|Guinea-Bissau
-LS|Lesotho
-LR|Liberia
-LY|Libya
-MG|Madagascar
-MW|Malawi
-ML|Mali
-MR|Mauritania
-MU|Mauritius
-MA|Morocco
-MZ|Mozambique
-NA|Namibia
-NE|Niger
-RW|Rwanda
-ST|São Tomé and Príncipe
-SN|Senegal
-SC|Seychelles
-SL|Sierra Leone
-SO|Somalia
-SS|South Sudan
-SD|Sudan
-TZ|Tanzania
-TG|Togo
-TN|Tunisia
-UG|Uganda
-ZM|Zambia
-ZW|Zimbabwe
-US|United States
-GB|United Kingdom
-CA|Canada
-AE|United Arab Emirates
-AU|Australia
-DE|Germany
-FR|France
-ES|Spain
-IT|Italy
-NL|Netherlands
-BE|Belgium
-PT|Portugal
-TR|Türkiye
-IN|India
-BR|Brazil
-MY|Malaysia
-SG|Singapore'''.splitlines())
+COUNTRIES = {'OM':'Oman','SA':'Saudi Arabia','AE':'United Arab Emirates','BH':'Bahrain','KW':'Kuwait','QA':'Qatar'}
+BANK_CODES = ['USD','OMR','SAR','AED','BHD','KWD','QAR']
 
-BACKUP_TABLES = ['users','settings','products','admin_product_drafts','bank_accounts','admin_sessions','vendors',
+BACKUP_TABLES = ['users','settings','products','admin_product_drafts','bank_accounts','admin_sessions','vendors','store_media',
                  'orders','payments','jobs','order_bank_details','invoice_messages','payment_audit','delivery_live','order_messages']
 
 
@@ -166,7 +100,7 @@ def backup_value(value):
 class FulfillmentUI(StoreUI):
     def __init__(self, app):
         super().__init__(app)
-        self.tz_name = os.getenv('DELIVERY_TIMEZONE', 'Africa/Lagos')
+        self.tz_name = os.getenv('DELIVERY_TIMEZONE', 'Asia/Dubai')
         self.tz = ZoneInfo(self.tz_name)
         self.backup_time = os.getenv('AUTO_BACKUP_UTC', '02:00').strip()
         if self.backup_time.lower() not in ('off','disabled',''):
@@ -175,68 +109,50 @@ class FulfillmentUI(StoreUI):
         self.last_backup_minute = None
 
     async def menu(self, chat):
-        return await self.send(chat, 'SnowmanBot Admin\nChoose what to manage.', [
-            ('➕ Add product','admin:add'), ('📦 Manage products','ui:products:0'),
-            ('🧾 Orders, payments & delivery','ui:orders:0'), ('🏦 Bank accounts & rates','ui:banks'),
-            ('🪙 Crypto wallets','ui:wallets'), ('🏪 Vendors','ful:vendors:0'),
-            ('🔔 Daily reminder','ui:reminder'), ('📊 Statistics','ui:stats'),
-            ('📨 Notification queue','ui:jobs'), ('💾 Export backup','ful:backupask'),
-            ('🆔 My Telegram ID','admin:myid'), ('❔ Help','ful:help')])
+        return await self.send(chat,f'SnowmanBot Admin\nChoose what to manage.\nVersion: {self.b.VERSION}',[
+            ('🎛 Store content & appearance','store:settings'),('➕ Add product','admin:add'),('📦 Manage products','ui:products:0'),
+            ('🧾 Orders, payments & delivery','ui:orders:0'),('🏦 Saved bank templates','ui:banks'),('🪙 Crypto wallets','ui:wallets'),
+            ('🔔 Daily reminder','ui:reminder'),('📊 Statistics','ui:stats'),('📨 Notification queue','ui:jobs'),
+            ('💾 Export backup','ful:backupask'),('🆔 My Telegram ID','admin:myid'),('❔ Help','store:help')])
 
     async def home(self, chat):
-        code = await self.b.db.fetchval('SELECT country FROM users WHERE id=$1', chat)
-        region = COUNTRIES.get(code, 'Choose your country')
-        await self.b.state(chat, {})
-        await self.b.main_bot.send(chat, 'Menu opened.', {'remove_keyboard':True})
-        return await self.b.main_bot.send(chat, f'SnowmanBot · {region}\nBrowse products without placing an order. Physical products use location-drop delivery at an agreed map point, with a requested delivery time.\n\nPhysical orders above $1,000 receive $150 off.', self.b.home_buttons())
+        pending=unpack(await self.b.db.fetchval('SELECT state FROM users WHERE id=$1',chat))
+        await self.b.state(chat,{})
+        if pending:
+            await self.b.main_bot.send(chat,'↩️ Back to the store.',{'remove_keyboard':True})
+        await self.welcome_media(chat,self.b.main_bot)
+        return await self.b.main_bot.send(chat,await self.welcome_text(),self.b.home_buttons())
 
     async def countries(self, chat, page=0, checkout=False, product_id=None):
-        codes=list(COUNTRIES)
-        page=max(0,min(page,(len(codes)-1)//8))
         if product_id is not None:
-            prefix=f'ful:pcountry:{product_id}'
-            items=[('🌍 All country profiles',prefix+':ALL')]
-            items += [(flag(c)+' '+COUNTRIES[c],prefix+':'+c) for c in codes[page*8:page*8+8]]
-            if page: items.append(('← Previous',f'ful:pcountries:{product_id}:{page-1}'))
-            if (page+1)*8<len(codes): items.append(('Next →',f'ful:pcountries:{product_id}:{page+1}'))
-            return await self.send(chat,'Choose where this product is listed.',items+MENU)
-        prefix='dropcountry' if checkout else 'countryset'
-        items=[(flag(c)+' '+COUNTRIES[c],prefix+':'+c) for c in codes[page*8:page*8+8]]
-        pager='dropcountries' if checkout else 'countries'
-        if page: items.append(('← Previous',f'{pager}:{page-1}'))
-        if (page+1)*8<len(codes): items.append(('Next →',f'{pager}:{page+1}'))
-        await self.b.main_bot.send(chat,'Choose your country profile. Delivery availability is confirmed by the store.',self.keys(items+[('✖ Cancel','home')]))
+            return await self.send(chat,'Country profiles are paused. All published products use the shared store.',MENU)
+        return await self.home(chat)
 
     async def catalog(self, chat, offset=0):
-        country=await self.b.db.fetchval('SELECT country FROM users WHERE id=$1',chat)
-        rows=await self.b.db.fetch("SELECT * FROM products WHERE published AND (country='' OR country=$1) ORDER BY id DESC LIMIT 5 OFFSET $2",country or '',offset)
+        rows=await self.b.db.fetch('SELECT * FROM products WHERE published ORDER BY id DESC LIMIT 5 OFFSET $1',max(0,offset))
         if not rows:
-            return await self.b.main_bot.send(chat,'No products are listed for this profile yet.',self.keys([('Choose country','countries:0'),('← Store','home')]))
-        for p in rows: await self.b.product_card(chat,p)
-        items=[('🌍 Change country','countries:0'),('← Store','home')]
-        if len(rows)==5: items.insert(0,('More products',f'catalog:{offset+5}'))
-        await self.b.main_bot.send(chat,'Browse products or choose a product to order.',self.keys(items))
+            return await self.b.main_bot.send(chat,'New products are coming soon.',self.keys([('Support','support'),('← Store','home')]))
+        for product in rows: await self.b.product_card(chat,product)
+        buttons=[('← Store','home')]
+        if len(rows)==5: buttons.insert(0,('More products',f'catalog:{offset+5}'))
+        await self.b.main_bot.send(chat,'🛍 Browse photos and USD prices. Select a product whenever you are ready to order.',self.keys(buttons))
 
     async def start_checkout(self, chat, product_id, method, request_key, currency=None):
         product=await self.b.db.fetchrow('SELECT * FROM products WHERE id=$1 AND published',product_id)
         if not product: raise ValueError('Product unavailable.')
         if product['kind']=='digital':
             return await self.b.begin_checkout(chat,product_id,method,request_key,currency,delivery_ready=True)
-        if method=='local':
-            if currency not in await self.b.local_methods(): raise ValueError('Choose an available bank-transfer currency.')
+        if method=='local': currency='USD'
         elif method not in self.b.enabled_crypto(): raise ValueError('This crypto option is unavailable.')
-        country=await self.b.db.fetchval('SELECT country FROM users WHERE id=$1',chat)
-        token=secrets.token_hex(5)
-        data=dict(drop_checkout=True,token=token,pid=product_id,method=method,currency=currency,request_key=request_key,stage='pin',country=country or '')
-        if product['country'] and country and product['country']!=country: raise ValueError('This product is not listed for your selected country.')
+        city=await self.b.db.fetchval('SELECT city FROM users WHERE id=$1',chat)
+        data=dict(drop_checkout=True,general_store=1,token=secrets.token_hex(5),pid=product_id,method=method,currency=currency,request_key=request_key,stage='city',city=city or '')
+        await self.b.state(chat,data)
         if method=='local':
             await self.b.alert_admins(self.b.db,'bank-choice:'+request_key,
-                f'Bank transfer selected\nCustomer: {chat}\nProduct: {product["name"]}\nCurrency: {currency}\nThe customer is choosing a drop-off point and delivery time.',
+                f'🏦 Local bank details requested\nCustomer: {chat}\nProduct: {product["name"]}\nPrices are in USD. Discuss the bank and any local-currency payment amount with the customer.',
                 buttons=self.keys([('Message customer',f'ful:chatuser:{chat}')]))
-        if not country: data['stage']='country'
-        await self.b.state(chat,data)
-        if not country: return await self.countries(chat,checkout=True)
-        return await self.pin_prompt(chat,data)
+            await self.b.main_bot.send(chat,'🏦 Message support for local bank details.\nSupport has been notified and can reply here. No bank account is displayed automatically.',self.keys([('💬 Message support','storechat')]))
+        return await self.city_prompt(chat,data)
 
     async def pin_prompt(self, chat, data):
         await self.b.main_bot.send(chat,'📍 Location-drop delivery\nSend your chosen drop-off point on the map so we can follow it and make the drop there. This is physical delivery to an agreed location, not home delivery.\n\nUse Telegram’s attachment → Location to choose a map pin. Share your current location only if that is the intended drop-off point.',
@@ -247,86 +163,75 @@ class FulfillmentUI(StoreUI):
 
     async def schedule_prompt(self, chat, data):
         await self.b.main_bot.send(chat,'Map point received.',{'remove_keyboard':True})
-        return await self.b.main_bot.send(chat,f'When would you like the physical delivery?\nRequested times use {self.tz_name}. The store confirms availability and sends the final ETA.',
-            self.keys([('As soon as available',f'drop:{data["token"]}:asap'),('Choose a delivery time',f'drop:{data["token"]}:days'),('✖ Cancel','home')]))
+        note=await self.copy('delivery')
+        return await self.b.main_bot.send(chat,f'🕒 When would you like delivery in {data.get("city","your city")}?\n{note}\nYou can also tell support a preferred time.',self.keys([
+            ('Same-day / as soon as available',f'drop:{data["token"]}:asap'),('Set a preferred delivery time',f'drop:{data["token"]}:preferred'),('✖ Cancel','home')]))
 
     async def dates(self, chat, data):
-        today=self.b.now().astimezone(self.tz).date()
-        items=[((today+timedelta(days=i)).strftime('%a %d %b'),f'drop:{data["token"]}:day:{(today+timedelta(days=i)).isoformat()}') for i in range(8)]
-        await self.b.main_bot.send(chat,f'Choose a delivery date ({self.tz_name}).',self.keys(items+[('✖ Cancel','home')]))
+        return await self.schedule_prompt(chat,data)
 
     async def times(self, chat, data, day):
-        try: date=datetime.strptime(day,'%Y-%m-%d').date()
-        except ValueError: raise ValueError('Choose a date from the buttons.')
-        current=self.b.now().astimezone(self.tz)
-        if not current.date()<=date<=current.date()+timedelta(days=7): raise ValueError('Choose a date within the next 7 days.')
-        items=[]
-        for hour in range(8,23):
-            slot=datetime.combine(date,datetime.min.time(),tzinfo=self.tz).replace(hour=hour)
-            if slot>current+timedelta(minutes=15): items.append((slot.strftime('%H:%M'),f'drop:{data["token"]}:time:{day}:{hour}'))
-        await self.b.main_bot.send(chat,f'Choose a requested time on {day} ({self.tz_name}).',self.keys(items+[('← Choose another day',f'drop:{data["token"]}:days'),('✖ Cancel','home')]))
+        return await self.schedule_prompt(chat,data)
 
     async def checkout_review(self, chat, data):
         product=await self.b.db.fetchrow('SELECT * FROM products WHERE id=$1 AND published',data['pid'])
         if not product: raise ValueError('Product unavailable.')
         subtotal,discount,total=quote_usd(product['price'])
-        when=data['schedule']['label']
-        await self.b.main_bot.call('sendLocation',chat_id=chat,**data['pin'])
-        await self.b.main_bot.send(chat,f'Review your order\n{product["name"]}\nCountry: {COUNTRIES[data["country"]]}\nPhysical location drop\nRequested time: {when}\nSubtotal: {self.b.format_amount(subtotal,"USD")}\nDiscount: {self.b.format_amount(discount,"USD")}\nTotal: {self.b.format_amount(total,"USD")}\n\nThe store confirms the delivery ETA after reviewing the order.',self.keys([
-            ('✅ Confirm checkout',f'drop:{data["token"]}:confirm'),('📍 Change map point',f'drop:{data["token"]}:pin'),('🕒 Change delivery time',f'drop:{data["token"]}:reschedule'),('✖ Cancel','home')]))
+        await self.b.main_bot.call('sendLocation',chat_id=chat,**location_pin(data['pin']))
+        await self.b.main_bot.send(chat,f'Review your order\n{product["name"]}\nCity: {data["city"]}\nPhysical location-drop delivery\nRequested time: {data["schedule"]["label"]}\nSubtotal: {self.b.format_amount(subtotal,"USD")}\nDiscount: {self.b.format_amount(discount,"USD")}\nTotal: {self.b.format_amount(total,"USD")}\n\nSupport confirms delivery availability and ETA for your city.',self.keys([
+            ('✅ Confirm checkout',f'drop:{data["token"]}:confirm'),('📍 Change map point',f'drop:{data["token"]}:pin'),('🕒 Change delivery time',f'drop:{data["token"]}:reschedule'),('🛡 Delivery & refund policy','policy'),('✖ Cancel','home')]))
 
     async def drop_action(self, chat, parts):
         user=await self.b.db.fetchrow('SELECT * FROM users WHERE id=$1',chat)
         data=unpack(user['state'])
         if not data.get('drop_checkout') or data.get('token')!=parts[1]: raise ValueError('This checkout form is closed. Choose the product again.')
+        if not data.get('general_store'):
+            data.update(general_store=1,stage='city',city=user.get('city','') if isinstance(user,dict) else user['city'])
+            data.pop('country',None);await self.b.state(chat,data);return await self.city_prompt(chat,data)
         action=parts[2]
+        if action=='savedcity' and data['stage']=='city' and user['city']:
+            data.update(city=user['city'],stage='pin');await self.b.state(chat,data);return await self.pin_prompt(chat,data)
         if action=='pin':
             data['stage']='pin';await self.b.state(chat,data);return await self.pin_prompt(chat,data)
         if action=='savedpin' and data['stage']=='pin':
-            data['pin']=location_pin(unpack(user['dropoff']));data['stage']='schedule'
-            await self.b.state(chat,data);return await self.schedule_prompt(chat,data)
+            data.update(pin=location_pin(unpack(user['dropoff'])),stage='schedule');await self.b.state(chat,data);return await self.schedule_prompt(chat,data)
         if action=='reschedule' and data.get('pin'):
             data['stage']='schedule';await self.b.state(chat,data);return await self.schedule_prompt(chat,data)
-        if action in ('days','day','time','asap') and data['stage']=='schedule':
-            if action=='days': return await self.dates(chat,data)
-            if action=='day': return await self.times(chat,data,parts[3])
-            if action=='asap': data['schedule']={'mode':'asap','label':'As soon as available; store confirms ETA','timezone':self.tz_name}
-            else:
-                try: slot=datetime.strptime(parts[3],'%Y-%m-%d').replace(hour=int(parts[4]),tzinfo=self.tz)
-                except (ValueError,IndexError): raise ValueError('Choose a valid delivery slot.')
-                if not 8<=slot.hour<=22 or not self.b.now()+timedelta(minutes=15)<slot<=self.b.now()+timedelta(days=8): raise ValueError('That slot is no longer available. Choose another time.')
-                data['schedule']={'mode':'scheduled','at':slot.astimezone(timezone.utc).isoformat(),'timezone':self.tz_name,'label':slot.strftime('%a %d %b %Y %H:%M')+' '+self.tz_name+' (requested)'}
-            data['stage']='review';await self.b.state(chat,data);return await self.checkout_review(chat,data)
+        if action in ('asap','preferred','days','day','time') and data['stage']=='schedule':
+            if action!='asap':
+                data['stage']='preferred_time';await self.b.state(chat,data)
+                return await self.b.main_bot.send(chat,'Send your preferred delivery time in your city’s local time, for example “6 PM today”. Support will confirm the time with you.',self.keys([('✖ Cancel','home')]))
+            data.update(schedule={'mode':'asap','label':'Same-day / as soon as available; support confirms city ETA'},stage='review')
+            await self.b.state(chat,data);return await self.checkout_review(chat,data)
         if action=='confirm' and data['stage']=='review':
-            p=await self.b.db.fetchrow('SELECT country FROM products WHERE id=$1 AND published',data['pid'])
-            if not p or (p['country'] and p['country']!=data['country']): raise ValueError('This product is unavailable for the selected country.')
-            if data['schedule'].get('at') and datetime.fromisoformat(data['schedule']['at'])<=self.b.now(): raise ValueError('Your chosen time has passed. Choose a new delivery time.')
+            product=await self.b.db.fetchrow('SELECT id FROM products WHERE id=$1 AND published',data['pid'])
+            if not product: raise ValueError('Product unavailable.')
             pin=location_pin(data['pin'])
-            await self.b.db.execute('UPDATE users SET country=$2,dropoff=$3::jsonb,delivery_schedule=$4::jsonb,shipping=$5 WHERE id=$1',chat,data['country'],json.dumps(pin),json.dumps(data['schedule']),f"Location drop: {pin['latitude']}, {pin['longitude']} | {data['schedule']['label']}")
-            await self.b.begin_checkout(chat,data['pid'],data['method'],'drop:'+data['request_key'],data.get('currency'),delivery_ready=True)
+            await self.b.db.execute('UPDATE users SET city=$2,dropoff=$3::jsonb,delivery_schedule=$4::jsonb,shipping=$5 WHERE id=$1',chat,data['city'],json.dumps(pin),json.dumps(data['schedule']),f'City: {data["city"]} | Location drop: {pin["latitude"]}, {pin["longitude"]} | {data["schedule"]["label"]}')
+            await self.b.begin_checkout(chat,data['pid'],data['method'],'drop:'+data['request_key'],'USD' if data['method']=='local' else None,delivery_ready=True)
             await self.b.state(chat,{})
             return
         raise ValueError('Use the buttons on the latest checkout prompt.')
 
     async def snapshot_delivery(self, conn, order, product, user):
         if product['kind']!='physical': return order
-        pin=location_pin(unpack(user['dropoff']))
-        schedule=unpack(user['delivery_schedule'])
-        if not schedule.get('label'): raise ValueError('Choose your delivery time first.')
+        pin=location_pin(unpack(user['dropoff']));schedule=unpack(user['delivery_schedule'])
+        if not user['city'] or not schedule.get('label'): raise ValueError('Enter your city and choose your delivery time first.')
         subtotal,discount,total=quote_usd(product['price'])
-        order=await conn.fetchrow('UPDATE orders SET country=$2,dropoff=$3::jsonb,delivery_schedule=$4::jsonb,subtotal_usd=$5,discount_usd=$6 WHERE id=$1 RETURNING *',order['id'],user['country'],json.dumps(pin),json.dumps(schedule),subtotal,discount)
-        await self.b.alert_admins(conn,f'new-drop:{order["id"]}',f'New location-drop order #{order["id"]}\nCustomer: {order["user_id"]}\nProduct: {order["name"]}\nRequested time: {schedule["label"]}\nPayment: {order["method"]}\nReview availability, payment and delivery ETA.',buttons=self.keys([('Open order',f'ui:order:{order["id"]}')]))
+        order=await conn.fetchrow("UPDATE orders SET country='',city=$2,dropoff=$3::jsonb,delivery_schedule=$4::jsonb,subtotal_usd=$5,discount_usd=$6 WHERE id=$1 RETURNING *",order['id'],user['city'],json.dumps(pin),json.dumps(schedule),subtotal,discount)
+        await self.b.alert_admins(conn,f'new-drop:{order["id"]}',f'New order #{order["id"]}\nCustomer: {order["user_id"]}\nCity: {user["city"]}\nProduct: {order["name"]}\nRequested time: {schedule["label"]}\nPayment: {order["method"]}\nConfirm the city’s availability, payment and delivery ETA.',buttons=self.keys([('Open order',f'ui:order:{order["id"]}')]))
         return order
 
     def delivery_summary(self, o):
         if o['kind']!='physical': return ''
         schedule=unpack(o.get('delivery_schedule'))
         text='\n\n📍 Physical location-drop delivery'
-        if o.get('country'): text+='\nCountry: '+COUNTRIES.get(o['country'],o['country'])
+        if o.get('city'): text+='\nCity: '+o['city']
         if schedule.get('label'): text+='\nRequested: '+schedule['label']
-        text+='\nETA: '+(o.get('eta') or 'Awaiting store confirmation')
+        text+='\nETA: '+(o.get('eta') or 'Support will confirm for your city')
         if o.get('subtotal_usd') is not None:
-            text+=f'\nSubtotal: {self.b.format_amount(o["subtotal_usd"],"USD")}\nDiscount: {self.b.format_amount(o.get("discount_usd",0),"USD")}'
+            subtotal=Decimal(o['subtotal_usd']);discount=Decimal(o.get('discount_usd',0))
+            text+=f'\nSubtotal: {self.b.format_amount(subtotal,"USD")}\nDiscount: {self.b.format_amount(discount,"USD")}\nUSD total: {self.b.format_amount(subtotal-discount,"USD")}'
         return text
 
     def order_text(self, order):
@@ -344,25 +249,32 @@ class FulfillmentUI(StoreUI):
     def order_buttons(self, order, bank=None):
         o=dict(order);buttons=super().order_buttons(o,bank if o.get('bank_released') else None)
         extra=[]
+        if o['method']=='local':
+            for row in buttons['inline_keyboard']:
+                for button in row:
+                    if button.get('text')=='📋 Copy amount': button['text']='📋 Copy USD order total' if o['currency']=='USD' else '📋 Copy order amount ('+o['currency']+')'
         if o['method']=='local' and o['status'] in OPEN:
             extra.append([{'text':'💬 Message store about payment','callback_data':f'orderchat:{o["id"]}'}])
         if unpack(o.get('dropoff')):
             extra.append([{'text':'📍 View my drop-off point','callback_data':f'droppoint:{o["id"]}'}])
+        extra.append([{'text':'🛡 Delivery & refund policy','callback_data':'policy'}])
+        if o['status'] in ('paid','fulfilled'):
+            extra.append([{'text':'↩️ Request a refund','callback_data':f'refundrequest:{o["id"]}'}])
         buttons['inline_keyboard']=extra+buttons['inline_keyboard']
         return buttons
 
     async def extra_order_buttons(self, o):
-        items=[('💬 Message customer',f'ful:chatorder:{o["id"]}')]
+        buttons=[('💬 Message customer',f'ful:chatorder:{o["id"]}')]
         if o['method']=='local' and o['status'] in OPEN:
-            items += [('🏦 Send saved bank details',f'ful:bankask:{o["id"]}'),('✏️ Write bank instructions',f'ful:bankcustom:{o["id"]}')]
+            buttons += [('🏦 Choose bank template',f'store:banktemplates:{o["id"]}'),('✏️ Write bank instructions',f'ful:bankcustom:{o["id"]}')]
         if o['kind']=='physical':
-            items += [('📍 View drop-off point',f'ful:drop:{o["id"]}')]
+            buttons.append(('📍 View drop-off point',f'ful:drop:{o["id"]}'))
             if o['status'] in ('paid','fulfilled'):
-                items += [('🕒 Set / update ETA',f'ful:eta:{o["id"]}'),('📡 Share delivery location',f'ful:track:{o["id"]}'),('⏹ Stop live tracking',f'ful:stoptrack:{o["id"]}')]
-        return items
+                buttons += [('🕒 Set / update ETA',f'ful:eta:{o["id"]}'),('📡 Share delivery location',f'ful:track:{o["id"]}'),('⏹ Stop live tracking',f'ful:stoptrack:{o["id"]}')]
+        return buttons
 
     async def extra_product_buttons(self, product):
-        return [('🌍 Set country profile',f'ful:pcountries:{product["id"]}:0')]
+        return []
 
     async def wallets(self, chat):
         lines=[]
@@ -376,11 +288,13 @@ class FulfillmentUI(StoreUI):
         command=text[0].split('@')[0].lower() if text else ''
         if command in ('/start','/cancel') or (message.get('text','')=='✖ Cancel'):
             await self.home(message['chat']['id']);return True
+        if command in ('/support','/paysupport'):
+            await self.customer_callback(message['chat']['id'],'support');return True
         if command=='/address':
             await self.customer_callback(message['chat']['id'],'deliverydetails');return True
         return False
 
-    async def customer_input(self, message, pending):
+    async def _previous_customer_input(self, message, pending):
         chat=message['chat']['id']
         if pending.get('drop_checkout'):
             if pending.get('stage')!='pin':
@@ -407,7 +321,7 @@ class FulfillmentUI(StoreUI):
             await self.b.main_bot.send(chat,'Your message was sent to the store.',self.keys(([('View order',f'receipt:{oid}')] if oid else [])+[('← Store','home')]));return True
         return await super().customer_input(message,pending)
 
-    async def customer_callback(self, chat, data):
+    async def _previous_customer_callback(self, chat, data):
         if data=='home': await self.home(chat);return True
         if data.startswith('catalog:'): await self.catalog(chat,int(data.split(':')[1]));return True
         if data.startswith('countries:'): await self.countries(chat,int(data.split(':')[1]));return True
@@ -446,7 +360,7 @@ class FulfillmentUI(StoreUI):
         if data.startswith('vendor:'): await self.public_vendor(chat,int(data.split(':')[1]));return True
         return await super().customer_callback(chat,data)
 
-    async def prompt(self, chat, data, token):
+    async def _previous_prompt(self, chat, data, token):
         flow=data['flow'];step=data['step'];key=lambda value:f'ful:form:{token}:{value}'
         if flow=='manual_bank':
             prompts={'instructions':'Type the bank payment instructions to send this customer. This will only be sent after you confirm (up to 1,800 characters).','number':'Send the exact account / IBAN / mobile-money number for the Copy button (up to 200 characters).','image':'Attach a bank-details screenshot as a photo, or tap Skip.'}
@@ -461,7 +375,7 @@ class FulfillmentUI(StoreUI):
             return await self.send(chat,prompts[step],([('All countries',key('allcountries'))] if step=='country' else [])+CANCEL)
         return await super().prompt(chat,data,token)
 
-    async def admin_message(self, message, request_key):
+    async def _previous_admin_message(self, message, request_key):
         chat=message['chat']['id']
         text=(message.get('text') or message.get('caption') or '').strip()
         if text in ('/start','/admin','/help','/cancel'):
@@ -678,7 +592,7 @@ class FulfillmentUI(StoreUI):
             output.seek(0)
             return output.read()
 
-    async def admin_callback(self, chat, data, request_key):
+    async def _previous_admin_callback(self, chat, data, request_key):
         if not data.startswith('ful:'): return await super().admin_callback(chat,data,request_key)
         parts=data.split(':');action=parts[1]
         if action=='help':
@@ -724,4 +638,263 @@ class FulfillmentUI(StoreUI):
             filename='SnowmanBot_backup_'+self.b.now().strftime('%Y%m%d_%H%M%S')+'.zip'
             await self.b.admin_bot.call('sendDocument',chat_id=chat,document=(filename,data))
             return await self.send(chat,'Backup exported. Keep this file together with the code release and your private hosting-variable configuration.')
+        return await self.menu(chat)
+
+    async def copy(self, field):
+        defaults={
+            'name':'SnowmanBot',
+            'welcome':'🛍 Browse product photos, check prices in USD and place your order with a few taps.',
+            'delivery':'📍 Same-day delivery in supported cities. Delivery time depends on your city; support confirms availability and the ETA.',
+            'refund':'Delivery is guaranteed. If you do not receive the quality you ordered, contact support for a refund. Support arranges and processes refunds.',
+            'support':self.b.SUPPORT,
+        }
+        if field not in defaults: raise ValueError('Choose a store-content field from the buttons.')
+        return await self.b.setting('store:'+field,defaults[field])
+
+    async def welcome_text(self):
+        return f'✨ Welcome to {await self.copy("name")}\n\n{await self.copy("welcome")}\n\n{await self.copy("delivery")}\n\n💳 Choose crypto or message support for local bank details.\n\n🛡 {await self.copy("refund")}\n\n🎁 Physical orders above $1,000 receive $150 off.'
+
+    async def welcome_media(self, chat, bot):
+        row=await self.b.db.fetchrow("SELECT * FROM store_media WHERE key='welcome'")
+        if not row: return
+        try:
+            if row['kind']=='sticker': await bot.call('sendSticker',chat_id=chat,sticker=(row['filename'],row['content']))
+            else: await bot.call('sendPhoto',chat_id=chat,photo=(row['filename'],row['content']))
+        except self.b.TGError as error:
+            if error.code not in (400,403): raise
+            self.b.LOG.warning('Welcome media could not be sent: Telegram %s',error.code)
+
+    async def content_panel(self, chat):
+        return await self.send(chat,'🎛 Store content & appearance\nEdit the text customers see. Product names, prices and photos are managed under Manage products.\n\nStore version: '+self.b.VERSION,[
+            ('✏️ Store display name','store:edit:name'),('💬 Welcome message','store:edit:welcome'),('🚚 Delivery message','store:edit:delivery'),
+            ('🛡 Delivery / refund policy','store:edit:refund'),('☎️ Support contact','store:edit:support'),
+            ('✨ Upload welcome sticker / photo','store:media'),('🧹 Remove welcome media','store:clearmedia'),('👁 Preview welcome','store:preview')]+MENU)
+
+    async def city_prompt(self, chat, data):
+        buttons=[('✖ Cancel','home')]
+        if data.get('city'): buttons.insert(0,('Use '+data['city'][:40],f'drop:{data["token"]}:savedcity'))
+        return await self.b.main_bot.send(chat,'🏙 Send your city for the delivery, for example Dubai, Doha or Muscat. No country selection is needed. Support confirms the delivery time based on your city.',self.keys(buttons))
+
+    async def local_methods(self):
+        # An enquiry is always available; the operator does not need to publish an account or FX rate first.
+        return {'USD':('Message support for local bank details.',Decimal('1'))}
+
+    async def bank_help(self, chat, product_id=0, request_key=None):
+        if product_id:
+            return await self.start_checkout(chat,product_id,'local',request_key or 'bank:'+secrets.token_hex(6),'USD')
+        key=request_key or 'bank-enquiry:'+secrets.token_hex(6)
+        await self.b.alert_admins(self.b.db,'bank-enquiry:'+key,f'🏦 Local bank payment enquiry\nCustomer: {chat}\nPlease reply with bank details and agree the payment amount.',buttons=self.keys([('Message customer',f'ful:chatuser:{chat}')]))
+        return await self.b.main_bot.send(chat,'🏦 Message support for local bank details.\nSupport has been notified. Product prices are in USD; support will explain how to pay by bank.',self.keys([('💬 Message support','storechat'),('Browse products','catalog:0'),('← Store','home')]))
+
+    async def snapshot_bank(self, conn, order, account=None):
+        data={field:'' for field in ('instructions','bank_name','account_name','account_number')}
+        await conn.execute('INSERT INTO order_bank_details(order_id,data,image) VALUES($1,$2::jsonb,NULL) ON CONFLICT DO NOTHING',order['id'],json.dumps(data))
+
+    async def bank_menu(self, chat):
+        rows=await self.b.db.fetch('SELECT * FROM bank_accounts')
+        items=[(f'{"✅" if r["enabled"] else "⏸"} {r["currency"]} · {r["bank_name"] or "Bank template"}',f'ui:bank:{r["currency"]}') for r in rows if r['currency'] in BANK_CODES]
+        return await self.send(chat,'🏦 Private bank templates\nPrices stay in USD. These accounts are only sent after you explicitly release them for an order. No exchange rate is required.',[('➕ Add / update bank template','ui:bankcodes:0')]+items+MENU)
+
+    async def currency_picker(self, chat, page=0):
+        return await self.send(chat,'Choose a private bank-template currency. This does not change the customer’s USD order price.',[(code,'ui:banknew:'+code) for code in BANK_CODES]+[('← Bank templates','ui:banks')])
+
+    async def bank_begin(self, chat, code):
+        if code not in BANK_CODES: raise ValueError('Choose a USD or supported Gulf bank template.')
+        old=await self.b.db.fetchrow('SELECT * FROM bank_accounts WHERE currency=$1',code)
+        data={field:old[field] if old else '' for field in ('instructions','bank_name','account_name','account_number')}
+        data.update(flow='bank_template',step='format',currency=code)
+        return await self.begin(chat,data,old['image'] if old else None)
+
+    async def bank_detail(self, chat, code):
+        row=await self.b.db.fetchrow('SELECT * FROM bank_accounts WHERE currency=$1',code)
+        if not row: return await self.bank_begin(chat,code)
+        if row['image']: await self.b.admin_bot.call('sendPhoto',chat_id=chat,photo=('bank.png',row['image']))
+        return await self.send(chat,f'Private template: {code}\n{self.bank_text(dict(row))}\n\nCustomer order prices remain in USD. Agree any local payment amount with the customer before sending these details.',[
+            ('✏️ Edit template','ui:banknew:'+code),('⏸ Disable' if row['enabled'] else '▶️ Enable','ui:banktoggle:'+code),('← Bank templates','ui:banks')])
+
+    async def customer_input(self, message, pending):
+        chat=message['chat']['id']
+        if pending.get('drop_checkout'):
+            if not pending.get('general_store'):
+                pending.update(general_store=1,stage='city',city='');pending.pop('country',None)
+                await self.b.state(chat,pending);await self.city_prompt(chat,pending);return True
+            stage=pending.get('stage')
+            if stage=='city':
+                text=message.get('text','').strip()
+                if not 1<=len(text)<=100 or not any(ch.isalpha() for ch in text): raise ValueError('Send your city name (up to 100 characters).')
+                pending.update(city=text,stage='pin');await self.b.state(chat,pending);await self.pin_prompt(chat,pending);return True
+            if stage=='pin':
+                if not message.get('location'): raise ValueError('Attach a map pin using Telegram’s attachment → Location.')
+                pending.update(pin=location_pin(message['location']),stage='schedule');await self.b.state(chat,pending);await self.schedule_prompt(chat,pending);return True
+            if stage=='preferred_time':
+                text=message.get('text','').strip()
+                if not 1<=len(text)<=160: raise ValueError('Send your preferred local delivery time (up to 160 characters).')
+                pending.update(schedule={'mode':'preferred','label':text+' (requested local time; support confirms for '+pending['city']+')'},stage='review')
+                await self.b.state(chat,pending);await self.checkout_review(chat,pending);return True
+            await self.b.main_bot.send(chat,'Use the latest checkout buttons to continue.',self.keys([('✖ Cancel','home')]));return True
+        return await self._previous_customer_input(message,pending)
+
+    async def customer_callback(self, chat, data, request_key=None):
+        if data in ('support','storecontact'):
+            contact=await self.copy('support')
+            await self.b.main_bot.send(chat,'💬 Support\n'+contact+'\n\nYou can also message support here about delivery, bank details or a refund.',self.keys([('Message support here','storechat'),('My orders','myorders'),('← Store','home')]))
+            return True
+        if data=='policy':
+            await self.b.main_bot.send(chat,'🛡 Delivery & refund policy\n\n'+await self.copy('delivery')+'\n\n'+await self.copy('refund'),self.keys([('Message support','storechat'),('← Store','home')]))
+            return True
+        if data.startswith('refundrequest:'):
+            oid=int(data.split(':')[1]);order=await self.owned_order(chat,oid)
+            if order['status'] not in ('paid','fulfilled'): raise ValueError('Only a paid order can start a refund request.')
+            await self.b.state(chat,{'order_message':oid})
+            await self.b.main_bot.send(chat,f'Describe the issue with order #{oid} and say that you are requesting a refund. Support will review and arrange the refund with you.',self.keys([('✖ Cancel','home')]))
+            return True
+        if data.startswith('bankhelp:'):
+            await self.bank_help(chat,int(data.split(':')[1]),request_key);return True
+        if data.startswith('local:') or data.startswith('bank:'):
+            await self.bank_help(chat,int(data.split(':')[1]),request_key);return True
+        if data in ('currencies',) or data.startswith('currency:'):
+            await self.bank_help(chat,request_key=request_key);return True
+        if data.startswith(('countries:','countryset:','dropcountry:','dropcountries:','vendors:','vendor:')):
+            pending=unpack(await self.b.db.fetchval('SELECT state FROM users WHERE id=$1',chat))
+            if pending.get('drop_checkout'):
+                pending.update(general_store=1,stage='city',city=pending.get('city',''));pending.pop('country',None)
+                await self.b.state(chat,pending);await self.city_prompt(chat,pending)
+            else: await self.home(chat)
+            return True
+        return await self._previous_customer_callback(chat,data)
+
+    async def prompt(self, chat, data, token):
+        flow=data['flow'];step=data['step'];key=lambda a:f'store:form:{token}:{a}'
+        if flow=='store_text':
+            if step=='review': return await self.send(chat,'Preview your new '+data['field']+' text:\n\n'+data['value'],[('✅ Save text',key('savetext'))]+CANCEL)
+            current=await self.copy(data['field'])
+            return await self.send(chat,'Send the new '+data['field']+' text. It will replace the current text after you review and save.\n\nCurrent:\n'+current,CANCEL)
+        if flow=='store_media': return await self.send(chat,'Send a Telegram sticker (static, animated or video) or upload a welcome photo. The bot will show it when opening the store.',CANCEL)
+        if flow=='bank_template':
+            if step=='format': return await self.send(chat,'Choose how to update the private bank instructions.',[('Enter text instructions',key('text')),('Upload bank screenshot',key('image')),('Keep current instructions',key('keep'))]+CANCEL)
+            prompts={'text':'Send the bank instructions (up to 1,800 characters).','image':'Upload the bank-details screenshot as a photo.','bank_name':'Send the bank / mobile-money provider name.','account_name':'Send the account holder name.','account_number':'Send the exact account / IBAN / mobile-money number for the Copy button.'}
+            if step=='review': return await self.send(chat,'Review private '+data['currency']+' template\n\n'+self.bank_text(data)+'\n\nSaving will not publish the account to customers.',[('Save private template',key('savebank'))]+CANCEL)
+            buttons=[('Keep current value',key('keepfield'))] if data.get(step) else []
+            return await self.send(chat,prompts[step],buttons+CANCEL)
+        return await self._previous_prompt(chat,data,token)
+
+    async def admin_message(self, message, request_key):
+        chat=message['chat']['id'];text=(message.get('text') or message.get('caption') or '').strip()
+        if text.split('@')[0].lower() in ('/start','/admin','/help','/cancel'): return await self._previous_admin_message(message,request_key)
+        row=await self.session(chat)
+        if not row: return await self._previous_admin_message(message,request_key)
+        data=unpack(row['data']);flow=data['flow']
+        if flow in ('bank','vendor'):
+            await self.b.db.execute('DELETE FROM admin_sessions WHERE admin_id=$1',chat)
+            return await self.send(chat,'That older form has closed. Use the updated menu.',MENU)
+        if flow not in ('store_text','store_media','bank_template'): return await self._previous_admin_message(message,request_key)
+        if data.get('last_message')==message.get('message_id'): return await self.prompt(chat,data,row['token'])
+        if flow=='store_text':
+            if data.get('step')=='review': return await self.send(chat,'Review the preview above, then save it.',[('Save text',f'store:form:{row["token"]}:savetext')]+CANCEL)
+            limits={'name':60,'welcome':1000,'delivery':700,'refund':1400,'support':300}
+            if not 1<=len(text)<=limits[data['field']]: raise ValueError('Text must contain 1–'+str(limits[data['field']])+' characters.')
+            data.update(value=text,step='review',last_message=message.get('message_id'))
+            await self.b.db.execute('UPDATE admin_sessions SET data=$2::jsonb WHERE admin_id=$1 AND token=$3',chat,json.dumps(data),row['token'])
+            return await self.send(chat,'Preview your new '+data['field']+' text:\n\n'+text,[('✅ Save text',f'store:form:{row["token"]}:savetext')]+CANCEL)
+        if flow=='store_media':
+            if message.get('sticker'):
+                item=message['sticker'];kind='sticker';filename='welcome.webm' if item.get('is_video') else 'welcome.tgs' if item.get('is_animated') else 'welcome.webp'
+            elif message.get('photo'): item=message['photo'][-1];kind='photo';filename='welcome.jpg'
+            else: raise ValueError('Send a Telegram sticker or a photo.')
+            content=await self.b.admin_bot.download(item['file_id'],8*1024*1024)
+            await self.b.db.execute("INSERT INTO store_media(key,kind,content,filename) VALUES('welcome',$1,$2,$3) ON CONFLICT(key) DO UPDATE SET kind=$1,content=$2,filename=$3",kind,content,filename)
+            await self.b.db.execute('DELETE FROM admin_sessions WHERE admin_id=$1',chat)
+            return await self.send(chat,'Welcome '+kind+' saved. Use Preview welcome to check it.',[('Preview welcome','store:preview'),('← Store settings','store:settings')])
+        step=data['step'];image=row['image']
+        if step=='text':
+            if not 1<=len(text)<=1800: raise ValueError('Send 1–1,800 characters of instructions.')
+            data.update(instructions=text,step='bank_name');image=None
+        elif step=='image':
+            if not message.get('photo'): raise ValueError('Upload the bank screenshot as a photo.')
+            image=await self.b.admin_bot.download(message['photo'][-1]['file_id'],5*1024*1024);data.update(instructions=message.get('caption','').strip()[:1800],step='bank_name')
+        elif step in ('bank_name','account_name','account_number'):
+            if not 1<=len(text)<=200: raise ValueError('Send 1–200 characters.')
+            data[step]=text;data['step']={'bank_name':'account_name','account_name':'account_number','account_number':'review'}[step]
+        else: return await self.prompt(chat,data,row['token'])
+        data['last_message']=message.get('message_id')
+        await self.b.db.execute('UPDATE admin_sessions SET data=$2::jsonb,image=$3 WHERE admin_id=$1 AND token=$4',chat,json.dumps(data),image,row['token'])
+        return await self.prompt(chat,data,row['token'])
+
+    async def store_form(self, chat, token, action):
+        row=await self.session(chat)
+        if not row or row['token']!=token: raise ValueError('This form is closed.')
+        data=unpack(row['data'])
+        if data['flow']=='store_text' and data['step']=='review' and action=='savetext':
+            async with self.b.db.acquire() as conn:
+                async with conn.transaction():
+                    active=await conn.fetchval('SELECT token FROM admin_sessions WHERE admin_id=$1 FOR UPDATE',chat)
+                    if active!=token: raise ValueError('This text was already saved or cancelled.')
+                    await conn.execute('INSERT INTO settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=$2','store:'+data['field'],data['value'])
+                    await conn.execute('DELETE FROM admin_sessions WHERE admin_id=$1 AND token=$2',chat,token)
+            return await self.content_panel(chat)
+        if data['flow']!='bank_template': raise ValueError('Use the current form buttons.')
+        if data['step']=='format' and action in ('text','image','keep'):
+            if action=='keep' and not (data.get('instructions') or row['image'] or data.get('account_number')): raise ValueError('Add bank instructions first.')
+            data['step']='bank_name' if action=='keep' else action
+        elif action=='keepfield' and data['step'] in ('bank_name','account_name','account_number') and data.get(data['step']):
+            data['step']={'bank_name':'account_name','account_name':'account_number','account_number':'review'}[data['step']]
+        elif action=='savebank' and data['step']=='review':
+            async with self.b.db.acquire() as conn:
+                async with conn.transaction():
+                    active=await conn.fetchval('SELECT token FROM admin_sessions WHERE admin_id=$1 FOR UPDATE',chat)
+                    if active!=token: raise ValueError('This bank template was already saved.')
+                    await conn.execute('''INSERT INTO bank_accounts(currency,instructions,bank_name,account_name,account_number,image,enabled)
+                        VALUES($1,$2,$3,$4,$5,$6,true) ON CONFLICT(currency) DO UPDATE SET instructions=$2,bank_name=$3,account_name=$4,account_number=$5,image=$6,enabled=true''',data['currency'],data['instructions'],data['bank_name'],data['account_name'],data['account_number'],row['image'])
+                    await conn.execute('DELETE FROM admin_sessions WHERE admin_id=$1 AND token=$2',chat,token)
+            return await self.bank_detail(chat,data['currency'])
+        else: return await self.prompt(chat,data,token)
+        await self.b.db.execute('UPDATE admin_sessions SET data=$2::jsonb WHERE admin_id=$1 AND token=$3',chat,json.dumps(data),token)
+        return await self.prompt(chat,data,token)
+
+    async def admin_callback(self, chat, data, request_key):
+        if data in ('ful:help','admin:help','ui:help'): data='store:help'
+        if data.startswith(('ful:pcountr','ful:vendor','ful:addvendor','ful:verifyask','ful:vstatus')):
+            return await self.send(chat,'Country profiles and vendors are paused for a later phase. All published products appear in the shared store.',MENU)
+        if data.startswith('ui:form:'):
+            old=await self.session(chat)
+            if old and unpack(old['data']).get('flow')=='bank':
+                await self.b.db.execute('DELETE FROM admin_sessions WHERE admin_id=$1',chat)
+                return await self.bank_menu(chat)
+        if data.startswith(('ful:bankask:','ful:banksend:')):
+            oid=int(data.split(':')[2]);snapshot=await self.b.db.fetchrow('SELECT * FROM order_bank_details WHERE order_id=$1',oid)
+            bank=unpack(snapshot['data']) if snapshot else {}
+            if not snapshot or not (snapshot['image'] or bank.get('instructions') or bank.get('account_number')):
+                return await self.send(chat,'Choose a saved template or write payment instructions before sending details.',[('Choose bank template',f'store:banktemplates:{oid}'),('Write bank instructions',f'ful:bankcustom:{oid}')]+MENU)
+        if not data.startswith('store:'): return await self._previous_admin_callback(chat,data,request_key)
+        parts=data.split(':');action=parts[1]
+        if action=='settings': return await self.content_panel(chat)
+        if action=='help': return await self.send(chat,'Use Store content & appearance to edit the welcome message, delivery/refund policy, support contact and welcome sticker/photo. Manage products controls prices and pictures. Prices stay in USD. Customers enter their city and map pin. Bank payments go to support before any account details are sent. The current release has one shared store with no country or vendor selector.')
+        if action=='edit':
+            if parts[2] not in ('name','welcome','delivery','refund','support'): raise ValueError('Choose a store-content field.')
+            return await self.begin(chat,{'flow':'store_text','step':'text','field':parts[2]})
+        if action=='form': return await self.store_form(chat,parts[2],parts[3])
+        if action=='media': return await self.begin(chat,{'flow':'store_media','step':'media'})
+        if action=='clearmedia':
+            await self.b.db.execute("DELETE FROM store_media WHERE key='welcome'")
+            return await self.content_panel(chat)
+        if action=='preview':
+            await self.welcome_media(chat,self.b.admin_bot)
+            return await self.send(chat,await self.welcome_text(),[('← Store settings','store:settings')])
+        if action in ('banktemplates','bankpick','bankrelease'):
+            oid=int(parts[2]);o=await self.b.db.fetchrow('SELECT * FROM orders WHERE id=$1',oid)
+            if not o or o['method']!='local' or o['status'] not in OPEN: raise ValueError('This bank order is not awaiting payment.')
+            if action=='banktemplates':
+                rows=await self.b.db.fetch('SELECT * FROM bank_accounts WHERE enabled')
+                items=[(r['currency']+' · '+(r['bank_name'] or 'Bank template'),f'store:bankpick:{oid}:{r["currency"]}') for r in rows if r['currency'] in BANK_CODES]
+                return await self.send(chat,'Choose private bank details to send. USD order total: '+self.b.format_amount(o['amount'],o['currency'])+'\nAgree any local payment amount with the customer. Templates do not change the order price.',items+[('Write custom instructions',f'ful:bankcustom:{oid}'),('Add bank template','ui:bankcodes:0')]+MENU)
+            code=parts[3]
+            if code not in BANK_CODES: raise ValueError('Choose a supported private template.')
+            row=await self.b.db.fetchrow('SELECT * FROM bank_accounts WHERE currency=$1 AND enabled',code)
+            if not row: raise ValueError('This bank template is unavailable.')
+            bank={field:row[field] for field in ('instructions','bank_name','account_name','account_number')}
+            if action=='bankpick':
+                if row['image']: await self.b.admin_bot.call('sendPhoto',chat_id=chat,photo=('bank.png',row['image']))
+                return await self.send(chat,f'Send these details to the customer for order #{oid}?\n\n{self.bank_text(bank)}\n\nConfirm any local payment amount in your instructions.',[('✅ Send bank details',f'store:bankrelease:{oid}:{code}'),('← Choose another template',f'store:banktemplates:{oid}')]+MENU)
+            await self.release_bank(chat,oid,bank,row['image'])
+            return await self.order_detail(chat,oid)
         return await self.menu(chat)
