@@ -36,7 +36,7 @@ def parse_admin_ids(raw):
 
 ADMINS = parse_admin_ids(os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID", ""))
 BOT_IDS = {}
-VERSION = "snowman-2026-10-25-general-store"
+VERSION = "snowman-2026-10-25-receipt-prompts"
 
 
 CURRENCIES = sorted(
@@ -407,7 +407,9 @@ async def begin_checkout(chat, product_id, method, request_key, currency=None, d
             currency="XTR", provider_token="", prices=[{"label": order["name"][:32], "amount": int(order["amount"])}],
             start_parameter=f"order_{order['id']}")
     else:
+        await state(chat, {})
         await show_order(chat, order)
+        await ui.request_receipt(chat, order)
 
 
 async def setting(key, default=""):
@@ -2182,6 +2184,7 @@ async def worker():
                     order = await db.fetchrow("SELECT * FROM orders WHERE id=$1", int(job["text"]))
                     if order and order["bank_released"] and order["status"] in ("pending", "review", "expired", "needs_review"):
                         await show_order(job["chat"], order)
+                        await ui.request_receipt(job["chat"], order)
                 elif job["target"] == "delivery":
                     order = await db.fetchrow(
                         "SELECT * FROM orders WHERE id=$1",

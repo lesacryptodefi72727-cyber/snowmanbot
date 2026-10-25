@@ -557,7 +557,7 @@ class StoreUI:
             if status == 'review': confirmation += '\nReceipt sent to admin for review'
             return title + f"{confirmation}\n\nSend exactly {self.b.format_amount(o['amount'], o['asset'])}\nNetwork: {self.b.ASSETS[o['asset']][0]}\nAddress:\n{o['address']}\n\n⏳ Time left: {countdown(o['expires'], self.b.now())}\nPay network fees separately. The address QR does not include the amount; use Copy exact amount.\nWe check the blockchain automatically and notify you after confirmation."
         if o['method'] == 'local':
-            return title + f"{'Receipt under review' if status == 'review' else 'Awaiting bank transfer'}\nAmount: {self.b.format_amount(o['amount'], o['currency'])}\nReference: SNOW-{o['id']}\n\n{o['note']}\n\nAfter paying, tap Upload receipt. The store checks its bank before approving."
+            return title + f"{'Receipt under review' if status == 'review' else 'Awaiting bank transfer'}\nAmount: {self.b.format_amount(o['amount'], o['currency'])}\nReference: SNOW-{o['id']}\n\n{o['note']}\n\nAfter paying, upload your payment receipt or screenshot here (or tap Upload receipt / screenshot). The store checks its bank before approving."
         return title + f"Status: {status}\nAmount: {self.b.format_amount(o['amount'], o['currency'])}"
 
     def order_buttons(self, o, bank=None):
@@ -571,7 +571,7 @@ class StoreUI:
                     if bank and bank.get(field): rows.append([copy_button(label, bank[field])])
                 rows += [[copy_button('📋 Copy amount', format(o['amount'], 'f'))], [copy_button('📋 Copy reference', f'SNOW-{oid}')]]
             if o['asset']: rows.append([{'text':'🔗 Submit transaction hash', 'callback_data':f'payhash:{oid}'}])
-            if o['method'] != 'stars': rows.append([{'text':'📸 Upload receipt', 'callback_data':f'payproof:{oid}'}])
+            if o['method'] != 'stars': rows.append([{'text':'📸 Upload receipt / screenshot', 'callback_data':f'payproof:{oid}'}])
         rows += [[{'text':'🔄 Refresh payment status', 'callback_data':f'receipt:{oid}'}], [{'text':'🧾 My orders', 'callback_data':'customerorders:0'}], [{'text':'💬 Support', 'callback_data':'support'}], [{'text':'← Store', 'callback_data':'home'}]]
         return {'inline_keyboard': rows}
 
@@ -608,7 +608,28 @@ class StoreUI:
         changed = await self.b.db.fetchval("UPDATE orders SET txid=$2,payment_seen=false WHERE id=$1 AND user_id=$3 AND status IN ('pending','review','expired','needs_review') RETURNING id", o['id'], value, chat)
         if not changed: raise ValueError('The order status changed. Refresh it to continue.')
         await self.b.state(chat, {})
-        await self.b.main_bot.send(chat, f"Transaction submitted for order #{o['id']}. We will verify the destination, exact amount, network, payment time and confirmations. You will receive an update after verification.", self.keys([('View payment', f"receipt:{o['id']}"), ('Upload receipt', f"payproof:{o['id']}")]))
+        await self.b.main_bot.send(chat, f"Transaction submitted for order #{o['id']}. We will verify the destination, exact amount, network, payment time and confirmations. You will receive an update after verification.", self.keys([('View payment', f"receipt:{o['id']}"), ('Upload receipt / screenshot', f"payproof:{o['id']}")]))
+
+    async def request_receipt(self, chat, order):
+        o = await self.owned_order(chat, order['id'])
+        if o['method'] == 'stars' or o['status'] not in OPEN or o.get('proof'):
+            return
+        pending = unpack(await self.b.db.fetchval('SELECT state FROM users WHERE id=$1', chat))
+        if not pending:
+            await self.b.state(chat, dict(payment_input='proof', oid=o['id'], receipt_prompt=True))
+        if o['asset'] and o['expires'] <= self.b.now():
+            text = 'If you already paid before the deadline, upload your payment receipt or screenshot here. Do not send a new payment to this expired quote.'
+        else:
+            text = 'After making your payment, upload your payment receipt or screenshot here.'
+            if o['method'] == 'local' and not o.get('bank_released', True):
+                text = 'Wait for support to send the bank details before paying.\n\n' + text
+        text = f"📸 Payment receipt for order #{o['id']}\n{text}\nSend a photo or attach the receipt file (up to 10 MB). No caption or command is needed."
+        text += '\n\nA receipt is sent to the admin for review. Payment still needs to be verified.'
+        await self.b.main_bot.send(chat, text, self.keys([
+            ('📸 Upload receipt / screenshot', f"payproof:{o['id']}"),
+            ('View payment details', f"receipt:{o['id']}"),
+            ('Message support about this order', f"orderchat:{o['id']}"),
+        ]))
 
     async def save_proof(self, chat, o, message):
         if o['method'] == 'stars' or o['status'] not in OPEN: raise ValueError('This order cannot accept a receipt now.')
@@ -634,8 +655,37 @@ class StoreUI:
             return True
         if pending.get('payment_input'):
             o = await self.owned_order(chat, pending['oid'])
+            if pending.get('receipt_prompt') and o['status'] not in OPEN:
+                await self.b.state(chat, {})
+                await self.show_order(chat, o)
+                return True
+            if pending['payment_input'] == 'proof' and o['asset'] and message.get('text'):
+                try: self.b.tx_hash(o['asset'], message['text'])
+                except ValueError: pass
+                else:
+                    await self.save_hash(chat, o, message['text'])
+                    return True
             if pending['payment_input'] == 'hash': await self.save_hash(chat, o, message.get('text', ''))
             else: await self.save_proof(chat, o, message)
+            return True
+        # Accept an attachment sent directly after viewing payment details.
+        # Never guess its order when several payments are still open.
+        if (not pending or pending.get('receipt_pick')) and (message.get('photo') or message.get('document')):
+            orders = await self.b.db.fetch("SELECT * FROM orders WHERE user_id=$1 AND method<>'stars' AND status IN ('pending','review','expired','needs_review') ORDER BY id DESC LIMIT 20", chat)
+            if len(orders) == 1:
+                await self.save_proof(chat, dict(orders[0]), message)
+            elif orders:
+                saved = {'message_id': message.get('message_id', 0)}
+                if message.get('photo'):
+                    saved['photo'] = [{'file_id': message['photo'][-1]['file_id']}]
+                else:
+                    saved['document'] = {k: message['document'][k] for k in ('file_id', 'file_name') if k in message['document']}
+                await self.b.state(chat, {'receipt_pick': saved})
+                await self.b.main_bot.send(chat, 'Which order is this receipt for? Choose below to attach the screenshot or file you just sent.', self.keys([
+                    (f"Order #{o['id']} · {o['name'][:35]}", f"proofpick:{o['id']}") for o in orders
+                ] + [('✖ Cancel', 'home')]))
+            else:
+                await self.b.main_bot.send(chat, 'There is no order waiting for a payment receipt. Open My orders to check your payment status.', self.keys([('My orders', 'myorders'), ('Support', 'support')]))
             return True
         # Accept a bare hash as in the user's screenshot; never guess between orders.
         text = message.get('text', '').strip()
@@ -653,6 +703,13 @@ class StoreUI:
         return False
 
     async def customer_callback(self, chat, data):
+        if data.startswith('proofpick:'):
+            pending = unpack(await self.b.db.fetchval('SELECT state FROM users WHERE id=$1', chat))
+            if not pending.get('receipt_pick'):
+                raise ValueError('This receipt selection is closed. Upload the screenshot or file again.')
+            o = await self.owned_order(chat, int(data.split(':')[1]))
+            await self.save_proof(chat, o, pending['receipt_pick'])
+            return True
         if data == 'support':
             await self.b.main_bot.send(chat, self.b.SUPPORT, self.keys([('My orders', 'customerorders:0'), ('← Store', 'home')]))
             return True

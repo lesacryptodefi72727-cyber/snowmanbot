@@ -77,6 +77,10 @@ def quote_usd(price):
     return price, discount, price-discount
 
 
+def delivery_words(text):
+    return re.sub(r'\beta\b', 'estimated delivery time', str(text), flags=re.IGNORECASE)
+
+
 def location_pin(value):
     try: lat, lon = float(value['latitude']), float(value['longitude'])
     except (KeyError,TypeError,ValueError): raise ValueError('Send a map location pin for the drop-off point.')
@@ -176,9 +180,10 @@ class FulfillmentUI(StoreUI):
     async def checkout_review(self, chat, data):
         product=await self.b.db.fetchrow('SELECT * FROM products WHERE id=$1 AND published',data['pid'])
         if not product: raise ValueError('Product unavailable.')
+        data['schedule']['label']=delivery_words(data['schedule']['label'])
         subtotal,discount,total=quote_usd(product['price'])
         await self.b.main_bot.call('sendLocation',chat_id=chat,**location_pin(data['pin']))
-        await self.b.main_bot.send(chat,f'Review your order\n{product["name"]}\nCity: {data["city"]}\nPhysical location-drop delivery\nRequested time: {data["schedule"]["label"]}\nSubtotal: {self.b.format_amount(subtotal,"USD")}\nDiscount: {self.b.format_amount(discount,"USD")}\nTotal: {self.b.format_amount(total,"USD")}\n\nSupport confirms delivery availability and ETA for your city.',self.keys([
+        await self.b.main_bot.send(chat,f'Review your order\n{product["name"]}\nCity: {data["city"]}\nPhysical location-drop delivery\nRequested time: {data["schedule"]["label"]}\nSubtotal: {self.b.format_amount(subtotal,"USD")}\nDiscount: {self.b.format_amount(discount,"USD")}\nTotal: {self.b.format_amount(total,"USD")}\n\nSupport confirms delivery availability and estimated delivery time for your city.',self.keys([
             ('✅ Confirm checkout',f'drop:{data["token"]}:confirm'),('📍 Change map point',f'drop:{data["token"]}:pin'),('🕒 Change delivery time',f'drop:{data["token"]}:reschedule'),('🛡 Delivery & refund policy','policy'),('✖ Cancel','home')]))
 
     async def drop_action(self, chat, parts):
@@ -201,7 +206,7 @@ class FulfillmentUI(StoreUI):
             if action!='asap':
                 data['stage']='preferred_time';await self.b.state(chat,data)
                 return await self.b.main_bot.send(chat,'Send your preferred delivery time in your city’s local time, for example “6 PM today”. Support will confirm the time with you.',self.keys([('✖ Cancel','home')]))
-            data.update(schedule={'mode':'asap','label':'Same-day / as soon as available; support confirms city ETA'},stage='review')
+            data.update(schedule={'mode':'asap','label':'Same-day / as soon as available; support confirms the estimated delivery time'},stage='review')
             await self.b.state(chat,data);return await self.checkout_review(chat,data)
         if action=='confirm' and data['stage']=='review':
             product=await self.b.db.fetchrow('SELECT id FROM products WHERE id=$1 AND published',data['pid'])
@@ -209,7 +214,6 @@ class FulfillmentUI(StoreUI):
             pin=location_pin(data['pin'])
             await self.b.db.execute('UPDATE users SET city=$2,dropoff=$3::jsonb,delivery_schedule=$4::jsonb,shipping=$5 WHERE id=$1',chat,data['city'],json.dumps(pin),json.dumps(data['schedule']),f'City: {data["city"]} | Location drop: {pin["latitude"]}, {pin["longitude"]} | {data["schedule"]["label"]}')
             await self.b.begin_checkout(chat,data['pid'],data['method'],'drop:'+data['request_key'],'USD' if data['method']=='local' else None,delivery_ready=True)
-            await self.b.state(chat,{})
             return
         raise ValueError('Use the buttons on the latest checkout prompt.')
 
@@ -217,9 +221,10 @@ class FulfillmentUI(StoreUI):
         if product['kind']!='physical': return order
         pin=location_pin(unpack(user['dropoff']));schedule=unpack(user['delivery_schedule'])
         if not user['city'] or not schedule.get('label'): raise ValueError('Enter your city and choose your delivery time first.')
+        schedule['label']=delivery_words(schedule['label'])
         subtotal,discount,total=quote_usd(product['price'])
         order=await conn.fetchrow("UPDATE orders SET country='',city=$2,dropoff=$3::jsonb,delivery_schedule=$4::jsonb,subtotal_usd=$5,discount_usd=$6 WHERE id=$1 RETURNING *",order['id'],user['city'],json.dumps(pin),json.dumps(schedule),subtotal,discount)
-        await self.b.alert_admins(conn,f'new-drop:{order["id"]}',f'New order #{order["id"]}\nCustomer: {order["user_id"]}\nCity: {user["city"]}\nProduct: {order["name"]}\nRequested time: {schedule["label"]}\nPayment: {order["method"]}\nConfirm the city’s availability, payment and delivery ETA.',buttons=self.keys([('Open order',f'ui:order:{order["id"]}')]))
+        await self.b.alert_admins(conn,f'new-drop:{order["id"]}',f'New order #{order["id"]}\nCustomer: {order["user_id"]}\nCity: {user["city"]}\nProduct: {order["name"]}\nRequested time: {schedule["label"]}\nPayment: {order["method"]}\nConfirm the city’s availability, payment and estimated delivery time.',buttons=self.keys([('Open order',f'ui:order:{order["id"]}')]))
         return order
 
     def delivery_summary(self, o):
@@ -228,18 +233,18 @@ class FulfillmentUI(StoreUI):
         text='\n\n📍 Physical location-drop delivery'
         if o.get('city'): text+='\nCity: '+o['city']
         if schedule.get('label'): text+='\nRequested: '+schedule['label']
-        text+='\nETA: '+(o.get('eta') or 'Support will confirm for your city')
+        text+='\nEstimated delivery time: '+(o.get('eta') or 'Support will confirm for your city')
         if o.get('subtotal_usd') is not None:
             subtotal=Decimal(o['subtotal_usd']);discount=Decimal(o.get('discount_usd',0))
             text+=f'\nSubtotal: {self.b.format_amount(subtotal,"USD")}\nDiscount: {self.b.format_amount(discount,"USD")}\nUSD total: {self.b.format_amount(subtotal-discount,"USD")}'
-        return text
+        return delivery_words(text)
 
     def order_text(self, order):
         o=dict(order)
         if o['method']=='local' and o['status'] in OPEN:
             title=f'Order #{o["id"]} · {o["name"]}\nAmount: {self.b.format_amount(o["amount"],o["currency"])}\nReference: SNOW-{o["id"]}'
             if o.get('bank_released'):
-                title+='\n\nPayment instructions from the store:\n'+o['note']+'\n\nAfter paying, tap Upload receipt.'
+                title+='\n\nPayment instructions from the store:\n'+o['note']+'\n\nAfter paying, upload your payment receipt or screenshot here (or tap Upload receipt / screenshot).'
             else:
                 title+='\n\n🏦 Bank transfer requested\nThe admin has been notified and will contact you here to arrange the bank transfer. Wait for payment instructions before sending money.'
             if o['status']=='review': title+='\nYour receipt is awaiting review.'
@@ -270,7 +275,7 @@ class FulfillmentUI(StoreUI):
         if o['kind']=='physical':
             buttons.append(('📍 View drop-off point',f'ful:drop:{o["id"]}'))
             if o['status'] in ('paid','fulfilled'):
-                buttons += [('🕒 Set / update ETA',f'ful:eta:{o["id"]}'),('📡 Share delivery location',f'ful:track:{o["id"]}'),('⏹ Stop live tracking',f'ful:stoptrack:{o["id"]}')]
+                buttons += [('🕒 Set / update estimated delivery time',f'ful:eta:{o["id"]}'),('📡 Share delivery location',f'ful:track:{o["id"]}'),('⏹ Stop live tracking',f'ful:stoptrack:{o["id"]}')]
         return buttons
 
     async def extra_product_buttons(self, product):
@@ -311,7 +316,7 @@ class FulfillmentUI(StoreUI):
             oid=pending.get('order_message')
             if oid: await self.owned_order(chat,oid)
             text=message.get('text','').strip()
-            if not 1<=len(text)<=2000: raise ValueError('Send your message as text (up to 2,000 characters). Use Upload receipt for a payment screenshot.')
+            if not 1<=len(text)<=2000: raise ValueError('Send your message as text (up to 2,000 characters). Tap Upload receipt / screenshot to send payment proof.')
             request=f'customer-message:{chat}:{message.get("message_id",0)}'
             async with self.b.db.acquire() as conn:
                 async with conn.transaction():
@@ -367,7 +372,7 @@ class FulfillmentUI(StoreUI):
             if step=='review':
                 return await self.send(chat,f'Send these instructions for order #{data["oid"]}?\n\n{data["instructions"]}\nCopyable account: {data["number"]}',[('✅ Send to customer',key('send'))]+CANCEL)
             return await self.send(chat,prompts[step],([('Skip image',key('skip'))] if step=='image' else [])+CANCEL)
-        prompts={'message':'Type your message to the customer (up to 2,000 characters).','eta':'Send the confirmed delivery time / ETA, including the date and timezone. This will be sent to the customer.','tracking':'Attach the delivery location. To share genuine live movement, use Telegram attachment → Location → Share Live Location. A static pin sends a one-time map update.'}
+        prompts={'message':'Type your message to the customer (up to 2,000 characters).','eta':'Send the estimated delivery time, including the date and timezone. This will be sent to the customer.','tracking':'Attach the delivery location. To share genuine live movement, use Telegram attachment → Location → Share Live Location. A static pin sends a one-time map update.'}
         if flow in prompts: return await self.send(chat,prompts[flow],CANCEL)
         if flow=='vendor':
             prompts={'name':'Send the vendor’s name.','country':'Send the country name or two-letter code, or tap All countries.','contact':'Send the public Telegram username (@username) or HTTPS contact link.','description':'Send a short vendor description (up to 1,000 characters).'}
@@ -393,12 +398,13 @@ class FulfillmentUI(StoreUI):
             await self.b.db.execute('DELETE FROM admin_sessions WHERE admin_id=$1',chat)
             return await self.send(chat,'Message queued for the customer. Customer replies appear in the admin bot.',MENU)
         if flow=='eta':
-            if not 1<=len(text)<=500: raise ValueError('Send the confirmed ETA in 1–500 characters.')
+            if not 1<=len(text)<=500: raise ValueError('Send the confirmed estimated delivery time in 1–500 characters.')
+            text=delivery_words(text)
             async with self.b.db.acquire() as conn:
                 async with conn.transaction():
                     order=await conn.fetchrow("UPDATE orders SET eta=$2 WHERE id=$1 AND kind='physical' AND status IN ('paid','fulfilled') RETURNING *",data['oid'],text)
-                    if not order: raise ValueError('Only paid physical orders can have a delivery ETA confirmed.')
-                    await self.b.queue(conn,f'eta:{request_key}','main',order['user_id'],f'Delivery update for order #{order["id"]}\nConfirmed ETA: {text}\nPhysical location-drop delivery.',buttons=self.keys([('View order',f'receipt:{order["id"]}'),('View drop-off point',f'droppoint:{order["id"]}')]))
+                    if not order: raise ValueError('Only paid physical orders can have an estimated delivery time confirmed.')
+                    await self.b.queue(conn,f'eta:{request_key}','main',order['user_id'],f'Delivery update for order #{order["id"]}\nEstimated delivery time: {text}\nPhysical location-drop delivery.',buttons=self.keys([('View order',f'receipt:{order["id"]}'),('View drop-off point',f'droppoint:{order["id"]}')]))
                     await conn.execute('DELETE FROM admin_sessions WHERE admin_id=$1',chat)
             return await self.order_detail(chat,data['oid'])
         if flow=='tracking':
@@ -505,7 +511,7 @@ class FulfillmentUI(StoreUI):
         else:
             await self.b.main_bot.call('sendLocation',chat_id=o['user_id'],**pin)
             kind='Delivery map update (one-time location pin).'
-        await self.b.main_bot.send(o['user_id'],f'Order #{oid}\n{kind}\nETA: {o["eta"] or "Awaiting store confirmation"}',self.keys([('View order',f'receipt:{oid}')]))
+        await self.b.main_bot.send(o['user_id'],f'Order #{oid}\n{kind}\nEstimated delivery time: {delivery_words(o["eta"]) if o["eta"] else "Awaiting store confirmation"}',self.keys([('View order',f'receipt:{oid}')]))
 
     async def handle_live_edit(self, message):
         admin=message['from']['id']
@@ -644,12 +650,13 @@ class FulfillmentUI(StoreUI):
         defaults={
             'name':'SnowmanBot',
             'welcome':'🛍 Browse product photos, check prices in USD and place your order with a few taps.',
-            'delivery':'📍 Same-day delivery in supported cities. Delivery time depends on your city; support confirms availability and the ETA.',
+            'delivery':'📍 Same-day delivery in supported cities. Delivery time depends on your city; support confirms availability and the estimated delivery time.',
             'refund':'Delivery is guaranteed. If you do not receive the quality you ordered, contact support for a refund. Support arranges and processes refunds.',
             'support':self.b.SUPPORT,
         }
         if field not in defaults: raise ValueError('Choose a store-content field from the buttons.')
-        return await self.b.setting('store:'+field,defaults[field])
+        value=await self.b.setting('store:'+field,defaults[field])
+        return delivery_words(value) if field in ('welcome','delivery','refund') else value
 
     async def welcome_text(self):
         return f'✨ Welcome to {await self.copy("name")}\n\n{await self.copy("welcome")}\n\n{await self.copy("delivery")}\n\n💳 Choose crypto or message support for local bank details.\n\n🛡 {await self.copy("refund")}\n\n🎁 Physical orders above $1,000 receive $150 off.'
