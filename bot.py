@@ -1665,6 +1665,15 @@ async def customer_message(message):
 
     if cmd in ("/cancel", "/start"):
         await state(chat, {})
+        if cmd == "/start" and rest.startswith("product_"):
+            try:
+                pid = int(rest[len("product_"):])
+            except ValueError:
+                pid = 0
+            if pid:
+                product = await db.fetchrow("SELECT * FROM products WHERE id=$1 AND published", pid)
+                if product:
+                    return await product_card(chat, product)
         return await main_bot.send(chat,
             "☃️ Welcome to SnowmanBot!\nBrowse our products and choose crypto or local bank transfer at checkout.\nDigital products use Stars.", home_buttons())
 
@@ -2307,9 +2316,42 @@ async def start_http(runtime, port=None):
         except Exception:
             return web.json_response({"status": "database_unavailable"}, status=503)
         return web.json_response({"status": runtime["role"], "version": VERSION})
+
+    # --- Read-only product API for the web storefront (Netlify site) ---
+    CORS = {"Access-Control-Allow-Origin": "*"}
+
+    async def api_products(request):
+        if not runtime["ready"] or db is None:
+            return web.json_response({"error": "starting"}, status=503, headers=CORS)
+        rows = await db.fetch(
+            "SELECT id,name,price,description FROM products "
+            "WHERE published AND kind='physical' ORDER BY id DESC")
+        items = [{
+            "id": r["id"], "name": r["name"], "price": float(r["price"]),
+            "description": r["description"] or "",
+            "image": f"/api/products/{r['id']}/image",
+        } for r in rows]
+        return web.json_response({"products": items}, headers=CORS)
+
+    async def api_product_image(request):
+        if db is None:
+            return web.Response(status=503, headers=CORS)
+        try:
+            pid = int(request.match_info["pid"])
+        except (KeyError, ValueError):
+            return web.Response(status=404, headers=CORS)
+        image = await db.fetchval(
+            "SELECT image FROM products WHERE id=$1 AND published", pid)
+        if not image:
+            return web.Response(status=404, headers=CORS)
+        return web.Response(body=bytes(image), content_type="image/jpeg",
+                            headers={**CORS, "Cache-Control": "public, max-age=300"})
+
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
+    app.router.add_get("/api/products", api_products)
+    app.router.add_get("/api/products/{pid}/image", api_product_image)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     selected_port = int(os.getenv("PORT", "10000")) if port is None else port
