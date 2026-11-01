@@ -2347,11 +2347,79 @@ async def start_http(runtime, port=None):
         return web.Response(body=bytes(image), content_type="image/jpeg",
                             headers={**CORS, "Cache-Control": "public, max-age=300"})
 
+    # --- Order-lead endpoint: the website posts a lead, we DM the admins ---
+    PREFLIGHT = {**CORS,
+                 "Access-Control-Allow-Methods": "POST, OPTIONS",
+                 "Access-Control-Allow-Headers": "Content-Type"}
+    order_hits = []
+
+    async def api_order(request):
+        if request.method == "OPTIONS":
+            return web.Response(status=204, headers=PREFLIGHT)
+        if not runtime["ready"] or db is None or admin_bot is None:
+            return web.json_response({"error": "starting"}, status=503, headers=CORS)
+        nowt = now().timestamp()           # light flood guard: 30 orders / 10 min
+        while order_hits and nowt - order_hits[0] > 600:
+            order_hits.pop(0)
+        if len(order_hits) >= 30:
+            return web.json_response({"error": "busy, try again shortly"},
+                                     status=429, headers=CORS)
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "bad request"}, status=400, headers=CORS)
+        username = str(data.get("username", "")).strip().lstrip("@")[:64]
+        if not username:
+            return web.json_response({"error": "username required"}, status=400, headers=CORS)
+        # Prefer the authoritative name/price from the DB; fall back to posted values.
+        name = str(data.get("product_name", "")).strip()[:200] or "(unspecified)"
+        price = str(data.get("price", "")).strip()[:64]
+        try:
+            pid = int(data.get("product_id"))
+        except (TypeError, ValueError):
+            pid = None
+        if pid is not None:
+            try:
+                row = await db.fetchrow(
+                    "SELECT name,price,currency FROM products WHERE id=$1 AND published", pid)
+                if row:
+                    name = row["name"]
+                    price = format_amount(row["price"], row["currency"])
+            except Exception:
+                pass
+        note = str(data.get("note", "")).strip()[:500]
+        maplink = ""
+        try:
+            lat = float(data.get("lat"))
+            lng = float(data.get("lng"))
+            if -90 <= lat <= 90 and -180 <= lng <= 180:
+                maplink = f"https://www.google.com/maps?q={lat:.6f},{lng:.6f}"
+        except (TypeError, ValueError):
+            pass
+        text = ("🌸 New website order\n\n"
+                f"Product: {name}\n"
+                f"Price: {price}\n"
+                f"Customer: @{username}\n"
+                + (f"📍 Location: {maplink}\n" if maplink else "")
+                + (f"Note: {note}\n" if note else "")
+                + f"\nMessage @{username} on Telegram to close the deal.")
+        order_hits.append(nowt)
+        sent = 0
+        for admin_id in ADMINS:
+            try:
+                await admin_bot.send(admin_id, text)
+                sent += 1
+            except Exception:
+                pass
+        return web.json_response({"ok": True, "notified": sent}, headers=CORS)
+
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
     app.router.add_get("/api/products", api_products)
     app.router.add_get("/api/products/{pid}/image", api_product_image)
+    app.router.add_post("/api/order", api_order)
+    app.router.add_route("OPTIONS", "/api/order", api_order)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     selected_port = int(os.getenv("PORT", "10000")) if port is None else port
